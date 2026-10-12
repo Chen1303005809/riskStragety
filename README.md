@@ -6,13 +6,13 @@
 
 | 目录 | 职责 |
 | --- | --- |
-| `frontend/` | React 聊天页面；`src/api.ts` 集中处理 HTTP、SSE、预览和下载请求。API Key 只在页面内存中。 |
+| `frontend/` | React 页面；`src/api.ts` 集中处理 HTTP、SSE、预览和下载请求。API Key 与账号 ID 只在页面内存中。 |
 | `backend/` | FastAPI 路由、Bearer 认证、环境配置、请求校验、SSE 映射和适配器装配。 |
 | `agent/` | 原文迁移的系统提示词、按轮次添加上海日期、历史消息组织和有上限的工具调用循环。无 FastAPI 依赖。 |
 | `interfaces/价格接口/` | 从旧项目迁入的 Python 接口源码。Agent 可列出和读取，运行时不写入。 |
 | `artifacts/` | 生成的 Python 源码及其账户归属元数据。服务自动创建，持续保存至人工清理。 |
 
-`AgentRunner.run(...)` 是后端调用 Agent 的边界，返回异步业务事件。模型、接口读取和产物存储都经接口注入。当前认证将共享 Key 映射为 `default` 账户，产物元数据已经记录 `account_id`；后续可替换认证和存储适配器来支持多账户及共享存储。每次聊天请求独立构造历史和工具状态，服务端不保存会话。
+`AgentRunner.run(...)` 是后端调用 Agent 的边界，返回异步业务事件。模型、接口读取和产物存储都经接口注入。当前认证将共享 Key 映射为 `default` 账户。聊天接口接收 `account_id`、`conversation_id`，下载接口接收 `account_id`，这些参数目前只做格式校验，不用于身份识别、数据隔离或持久化。每次聊天请求独立构造历史和工具状态，服务端不保存会话。网页默认展示未接入数据的监控界面空壳；聊天功能仍可通过“策略对话”入口使用。
 
 ## 本地启动
 
@@ -39,17 +39,17 @@ set +a
 python -m backend
 ```
 
-在浏览器打开 `http://<服务所在主机>:8765/`，输入同一个 API Key。前端开发时，在两个终端分别启动后端和 `cd frontend && npm run dev`；Vite 会将 `/api` 代理到本机的 8765 端口。生产部署时，请限制服务仅在可信局域网可达；跨网访问可在前面加 HTTPS 反向代理。
+在浏览器打开 `http://<服务所在主机>:8765/`，进入“策略对话”并输入 API Key 和账号 ID。前端开发时，在两个终端分别启动后端和 `cd frontend && npm run dev`；Vite 会将 `/api` 代理到本机的 8765 端口。生产部署时，请限制服务仅在可信局域网可达；跨网访问可在前面加 HTTPS 反向代理。
 
 ## HTTP 接口
 
-所有 `/api` 接口都要求 `Authorization: Bearer <AGENT_API_KEY>`。每次请求携带此前完整的 user/assistant 历史，不接受系统消息。历史只存在客户端页面内存中，刷新后需要重新开始。
+所有 `/api` 接口都要求 `Authorization: Bearer <AGENT_API_KEY>`。聊天请求还必须提供 `account_id` 和 UUID 格式的 `conversation_id`；下载请求必须提供 `account_id`。第一版只接收并校验这些参数，不据此创建账号、保存会话或筛选产物。每次聊天请求携带此前完整的 user/assistant 历史，不接受系统消息。历史只存在客户端页面内存中，刷新后需要重新开始。
 
 ```bash
 curl -N http://127.0.0.1:8765/api/agent/chat/stream \
   -H "Authorization: Bearer $AGENT_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"message":"SHFE rb2710 超过 3900 时预警","history":[],"model":"qwen3:8b","options":{"temperature":0.3,"top_p":0.8,"num_ctx":16384},"think":false}'
+  -d '{"account_id":"demo-account","conversation_id":"550e8400-e29b-41d4-a716-446655440000","message":"SHFE rb2710 超过 3900 时预警","history":[],"model":"qwen3:8b","options":{"temperature":0.3,"top_p":0.8,"num_ctx":16384},"think":false}'
 ```
 
 `options.temperature` 范围为 `0–2`，`options.top_p` 范围为 `0–1`，`options.num_ctx` 范围为 `512–131072` 的整数。省略 `options` 或 `think` 时分别使用 `0.3`、`0.8`、`16384` 和 `false`。
@@ -75,13 +75,13 @@ curl http://127.0.0.1:8765/api/models \
 curl -X POST http://127.0.0.1:8765/api/artifacts/download \
   -H "Authorization: Bearer $AGENT_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"artifact_id":"<artifact 事件里的 32 位 ID>"}' \
+  -d '{"artifact_id":"<artifact 事件里的 32 位 ID>","account_id":"demo-account"}' \
   -o strategy.py
 ```
 
-下载接口按 `artifact_id` 查找文件，并核对当前账户身份。成功响应以 `application/octet-stream` 分块发送原始 UTF-8 文件字节，并通过 `Content-Disposition` 提供 `.py` 文件名；浏览器客户端可读取响应字节并生成 `.py` 文件。生成文件以唯一的 `RHTemplate` 策略主类名命名，例如 `RiskAlertStrategy` 类保存为 `RiskAlertStrategy.py`。文件名只允许直接的 `.py` 文件名；接口读取和产物下载都拒绝路径穿越及符号链接。人工清理时可按 ID 删除 `artifacts/` 下对应的 `.py` 与 `.json` 文件。
+下载接口按 `artifact_id` 查找文件，并继续按当前固定的 `default` 账户核对产物归属；请求中的 `account_id` 暂不参与判断。成功响应以 `application/octet-stream` 分块发送原始 UTF-8 文件字节，并通过 `Content-Disposition` 提供 `.py` 文件名；浏览器客户端可读取响应字节并生成 `.py` 文件。生成文件以唯一的 `RHTemplate` 策略主类名命名，例如 `RiskAlertStrategy` 类保存为 `RiskAlertStrategy.py`。文件名只允许直接的 `.py` 文件名；接口读取和产物下载都拒绝路径穿越及符号链接。人工清理时可按 ID 删除 `artifacts/` 下对应的 `.py` 与 `.json` 文件。
 
-Python 客户端示例见 [`examples/download_artifact_client.py`](examples/download_artifact_client.py)，它会分块接收二进制响应并增量解码为 UTF-8 源码文本。运行前，在文件末尾的 `if __name__ == "__main__"` 代码块中填写 API Key 和 artifact ID，并按需修改服务地址与输出文件名。
+Python 客户端示例见 [`examples/download_artifact_client.py`](examples/download_artifact_client.py)，它会分块接收二进制响应并增量解码为 UTF-8 源码文本。运行前，在文件末尾的 `if __name__ == "__main__"` 代码块中填写 API Key、账号 ID 和 artifact ID，并按需修改服务地址与输出文件名。
 
 ```bash
 .venv/bin/python3.12 examples/download_artifact_client.py

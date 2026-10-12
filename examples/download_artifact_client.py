@@ -32,11 +32,13 @@ def strategy_filename(source: str) -> str:
     return f"{strategy_classes[0].name}.py"
 
 
-def download_artifact_source(base_url: str, api_key: str, artifact_id: str) -> str:
+def download_artifact_source(
+    base_url: str, api_key: str, account_id: str, artifact_id: str
+) -> str:
     """Read the binary response in chunks and return its UTF-8 source text."""
     request = Request(
         f"{base_url.rstrip('/')}/api/artifacts/download",
-        data=json.dumps({"artifact_id": artifact_id}).encode("utf-8"),
+        data=json.dumps({"artifact_id": artifact_id, "account_id": account_id}).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -71,10 +73,11 @@ def download_artifact_source(base_url: str, api_key: str, artifact_id: str) -> s
 if __name__ == "__main__":
     base_url = "http://127.0.0.1:8765"
     api_key = ""
+    account_id = ""
     artifact_id = ""
 
     try:
-        source = download_artifact_source(base_url, api_key, artifact_id)
+        source = download_artifact_source(base_url, api_key, account_id, artifact_id)
         output_path = Path(strategy_filename(source))
     except (OSError, RuntimeError, SyntaxError, ValueError) as error:
         print(error, file=sys.stderr)

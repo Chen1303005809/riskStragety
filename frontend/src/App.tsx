@@ -41,9 +41,83 @@ function makeMessage(role: ChatMessage['role'], content: string, status: ChatMes
   return { id: crypto.randomUUID(), role, content, status, artifacts: [] };
 }
 
+function MonitorDashboard() {
+  return (
+    <main className="main-area monitor-area">
+      <div className="monitor-heading">
+        <div>
+          <span className="eyebrow">MONITOR / OVERVIEW</span>
+          <h1>账号运行监控</h1>
+          <p>集中查看账号对话、会话活动和生成文件。</p>
+        </div>
+        <span className="monitor-state"><span className="monitor-state-dot" />数据接口待接入</span>
+      </div>
+
+      <section className="monitor-board" aria-label="账号与会话监控">
+        <aside className="monitor-index">
+          <section className="monitor-card monitor-list-card" aria-labelledby="monitor-accounts-title">
+            <div className="monitor-card-heading">
+              <div><span className="eyebrow">ACCOUNTS</span><h2 id="monitor-accounts-title">账号</h2></div>
+              <span className="monitor-state-tag">未接入</span>
+            </div>
+            <div className="monitor-empty compact">
+              <span className="monitor-empty-icon" aria-hidden="true">◌</span>
+              <strong>暂无账号数据</strong>
+              <p>接入监控数据后，账号会显示在这里。</p>
+            </div>
+          </section>
+
+          <section className="monitor-card monitor-list-card" aria-labelledby="monitor-sessions-title">
+            <div className="monitor-card-heading">
+              <div><span className="eyebrow">SESSIONS</span><h2 id="monitor-sessions-title">会话</h2></div>
+              <span className="monitor-state-tag">未接入</span>
+            </div>
+            <div className="monitor-empty compact">
+              <span className="monitor-empty-icon" aria-hidden="true">▤</span>
+              <strong>暂无会话数据</strong>
+              <p>选择账号后可在这里浏览会话。</p>
+            </div>
+          </section>
+        </aside>
+
+        <div className="monitor-content">
+          <section className="monitor-card monitor-detail-card" aria-labelledby="monitor-conversation-title">
+            <div className="monitor-card-heading">
+              <div><span className="eyebrow">CONVERSATION</span><h2 id="monitor-conversation-title">对话详情</h2></div>
+              <span className="monitor-state-tag">未接入</span>
+            </div>
+            <div className="monitor-empty">
+              <span className="monitor-empty-icon large" aria-hidden="true">☷</span>
+              <strong>暂无对话内容</strong>
+              <p>当前版本尚未接入服务端会话历史。</p>
+            </div>
+          </section>
+
+          <section className="monitor-card monitor-detail-card" aria-labelledby="monitor-files-title">
+            <div className="monitor-card-heading">
+              <div><span className="eyebrow">GENERATED FILES</span><h2 id="monitor-files-title">生成文件</h2></div>
+              <span className="monitor-state-tag">未接入</span>
+            </div>
+            <div className="monitor-empty">
+              <span className="monitor-empty-icon large" aria-hidden="true">▧</span>
+              <strong>暂无文件记录</strong>
+              <p>会话关联的生成文件将在数据接入后显示。</p>
+            </div>
+          </section>
+        </div>
+      </section>
+      <p className="monitor-footnote">本页为监控界面占位，当前不会读取、保存或筛选账号数据。</p>
+    </main>
+  );
+}
+
 export default function App() {
+  const [activePage, setActivePage] = useState<'monitor' | 'chat'>('monitor');
   const [apiKey, setApiKey] = useState('');
   const [keyDraft, setKeyDraft] = useState('');
+  const [accountId, setAccountId] = useState('');
+  const [accountIdDraft, setAccountIdDraft] = useState('');
+  const [conversationId, setConversationId] = useState(() => crypto.randomUUID());
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState('');
   const [modelOptions, setModelOptions] = useState<ModelOptions>({
@@ -92,8 +166,13 @@ export default function App() {
   async function connect(event: FormEvent) {
     event.preventDefault();
     const key = keyDraft.trim();
+    const account = accountIdDraft.trim();
     if (!key) {
       setConnectionError('请输入 API Key');
+      return;
+    }
+    if (!account) {
+      setConnectionError('请输入账号 ID');
       return;
     }
     setConnecting(true);
@@ -103,6 +182,8 @@ export default function App() {
       if (!names.length) throw new Error('Ollama 中没有已安装的模型');
       setApiKey(key);
       setKeyDraft('');
+      setAccountId(account);
+      setAccountIdDraft('');
       setModels(names);
       setModel(names.includes(defaultModel) ? defaultModel : names[0]);
     } catch (error) {
@@ -115,8 +196,11 @@ export default function App() {
   function disconnect() {
     abortRef.current?.abort();
     setApiKey('');
+    setAccountId('');
+    setAccountIdDraft('');
     setModels([]);
     setModel('');
+    setConversationId(crypto.randomUUID());
     setPreview(null);
     commitMessages([]);
     setNotice('');
@@ -125,6 +209,7 @@ export default function App() {
   function newConversation() {
     if (busy) return;
     commitMessages([]);
+    setConversationId(crypto.randomUUID());
     setPreview(null);
     setNotice('');
   }
@@ -147,7 +232,15 @@ export default function App() {
     abortRef.current = controller;
 
     try {
-      await streamChat(apiKey, { message, history, model, options: modelOptions, think }, {
+      await streamChat(apiKey, {
+        account_id: accountId,
+        conversation_id: conversationId,
+        message,
+        history,
+        model,
+        options: modelOptions,
+        think,
+      }, {
         onStatus: (phase, tool) => setActivity(activityText(phase, tool)),
         onDelta: (text) => {
           const current = messagesRef.current.find((item) => item.id === assistant.id);
@@ -194,7 +287,7 @@ export default function App() {
     setArtifactBusy(artifact.artifact_id);
     setNotice('');
     try {
-      const blob = await fetchArtifact(apiKey, artifact.artifact_id);
+      const blob = await fetchArtifact(apiKey, artifact.artifact_id, accountId);
       setPreview({ artifact, source: decodeArtifactSource(await blob.arrayBuffer()) });
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '无法读取生成文件');
@@ -207,7 +300,7 @@ export default function App() {
     setArtifactBusy(artifact.artifact_id);
     setNotice('');
     try {
-      const blob = await fetchArtifact(apiKey, artifact.artifact_id);
+      const blob = await fetchArtifact(apiKey, artifact.artifact_id, accountId);
       const file = parsePythonFile(await blob.arrayBuffer(), artifact.filename);
       const url = URL.createObjectURL(file);
       const anchor = document.createElement('a');
@@ -234,9 +327,26 @@ export default function App() {
             <small>价格预警 · 代码生成</small>
           </div>
         </div>
+        <nav className="primary-nav" aria-label="主导航">
+          <button
+            className={activePage === 'monitor' ? 'primary-nav-item active' : 'primary-nav-item'}
+            type="button"
+            aria-pressed={activePage === 'monitor'}
+            onClick={() => setActivePage('monitor')}
+          >监控总览</button>
+          <button
+            className={activePage === 'chat' ? 'primary-nav-item active' : 'primary-nav-item'}
+            type="button"
+            aria-pressed={activePage === 'chat'}
+            onClick={() => setActivePage('chat')}
+          >策略对话</button>
+        </nav>
         <div className="topbar-actions">
-          {apiKey ? (
+          {apiKey && activePage === 'chat' ? (
             <>
+              <span className="account-context" title={'账号 ID：' + accountId}>
+                <small>ACCOUNT</small><strong>{accountId}</strong>
+              </span>
               <label className="model-control">
                 <span>模型</span>
                 <select value={model} onChange={(event) => setModel(event.target.value)} disabled={busy}>
@@ -300,11 +410,11 @@ export default function App() {
               <span className="connected"><span className="connected-dot" /> 已连接</span>
               <button className="quiet-button" type="button" onClick={disconnect}>退出</button>
             </>
-          ) : <span className="offline">等待连接</span>}
+          ) : activePage === 'chat' ? <span className="offline">等待连接</span> : null}
         </div>
       </header>
 
-      <main className="main-area">
+      {activePage === 'monitor' ? <MonitorDashboard /> : <main className="main-area">
         <div className="workspace-heading">
           <div>
             <span className="eyebrow">WORKSPACE / 01</span>
@@ -322,9 +432,18 @@ export default function App() {
             <div>
               <span className="eyebrow">连接服务</span>
               <h2>输入 API Key 开始</h2>
-              <p>密钥仅保留在当前页面内存，用于访问内网中的 Agent 服务。</p>
+              <p>密钥和账号 ID 只保留在当前页面内存；账号 ID 目前随请求传递，不用于数据隔离。</p>
             </div>
             <form onSubmit={connect} className="connection-form">
+              <input
+                type="text"
+                value={accountIdDraft}
+                onChange={(event) => setAccountIdDraft(event.target.value)}
+                placeholder="输入账号 ID"
+                autoComplete="off"
+                aria-label="账号 ID"
+                required
+              />
               <input
                 type="password"
                 value={keyDraft}
@@ -332,6 +451,7 @@ export default function App() {
                 placeholder="输入 AGENT_API_KEY"
                 autoComplete="off"
                 aria-label="API Key"
+                required
               />
               <button type="submit" disabled={connecting}>{connecting ? '连接中…' : '连接并读取模型'}</button>
             </form>
@@ -395,7 +515,7 @@ export default function App() {
             </form>
           </section>
         )}
-      </main>
+      </main>}
 
       <footer className="page-footer"><span>RISK STRATEGY / AGENT</span><span>接口源码只读 · 生成文件独立保存</span></footer>
 

@@ -43,7 +43,14 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .brand-mark::after { width: 15px; left: 24px; top: 12px; }
 .brand strong { display: block; font-size: 15px; letter-spacing: .01em; }
 .brand small { display: block; margin-top: 3px; font-size: 11px; letter-spacing: .08em; color: #81918a; }
+.primary-nav { display: flex; align-items: center; gap: 4px; padding: 4px; background: #f4f7f3; border: 1px solid #e8ede7; border-radius: 10px; }
+.primary-nav-item { border: 0; border-radius: 7px; background: transparent; color: #748179; padding: 9px 15px; font-size: 13px; white-space: nowrap; }
+.primary-nav-item:hover { color: #225342; background: #eaf2eb; }
+.primary-nav-item.active { color: #174c3c; background: #fff; box-shadow: 0 1px 4px #1f4a2814; font-weight: 650; }
 .topbar-actions { display: flex; align-items: center; gap: 20px; }
+.account-context { display: flex; flex-direction: column; gap: 3px; min-width: 0; max-width: 150px; color: #315546; }
+.account-context small { color: #8a9b90; font-size: 9px; letter-spacing: .12em; }
+.account-context strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; }
 .model-control { display: flex; align-items: center; gap: 10px; color: #677a70; font-size: 13px; }
 .model-control select {
   min-width: 175px; max-width: 290px; height: 37px;
@@ -98,6 +105,30 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   color: #325446; padding: 10px 14px; white-space: nowrap; font-size: 13px;
 }
 .new-chat-button:hover { border-color: #8eb7a6; background: #f4faf5; }
+
+.monitor-area { width: min(100%, 1500px); padding: 42px clamp(20px, 4.5vw, 68px) 28px; }
+.monitor-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 0 3px 26px; }
+.monitor-heading h1 { margin: 10px 0 8px; font-size: clamp(27px, 3vw, 36px); letter-spacing: -.04em; }
+.monitor-heading p { margin: 0; color: #718078; font-size: 14px; }
+.monitor-state { display: inline-flex; align-items: center; gap: 8px; padding: 9px 12px; border: 1px solid #e4e9e2; border-radius: 999px; color: #7b897f; background: #fff; font-size: 11px; white-space: nowrap; }
+.monitor-state-dot { width: 7px; height: 7px; border-radius: 50%; background: #c49a55; }
+.monitor-board { display: grid; grid-template-columns: minmax(235px, .7fr) minmax(0, 2fr); gap: 16px; min-height: 535px; }
+.monitor-index { display: grid; grid-template-rows: repeat(2, minmax(250px, 1fr)); gap: 16px; }
+.monitor-content { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(250px, .85fr); gap: 16px; }
+.monitor-card { min-width: 0; display: flex; flex-direction: column; overflow: hidden; border: 1px solid #e2e8e2; border-radius: 14px; background: #fff; box-shadow: 0 10px 35px #1f4a2809; }
+.monitor-list-card { min-height: 250px; }
+.monitor-detail-card { min-height: 535px; }
+.monitor-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 19px 20px 16px; border-bottom: 1px solid #edf1ec; }
+.monitor-card-heading .eyebrow { font-size: 9px; letter-spacing: .15em; }
+.monitor-card-heading h2 { margin: 5px 0 0; color: #243b2f; font-size: 16px; font-weight: 650; }
+.monitor-state-tag { border: 1px solid #e7ebe5; border-radius: 6px; color: #8a978d; background: #fafbf9; padding: 5px 7px; font-size: 10px; white-space: nowrap; }
+.monitor-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; padding: 28px; color: #7b8b80; text-align: center; }
+.monitor-empty.compact { gap: 7px; padding: 22px; }
+.monitor-empty-icon { display: grid; place-items: center; width: 37px; height: 37px; border: 1px solid #e5ece5; border-radius: 11px; color: #8ba391; background: #f5f8f4; font-size: 20px; }
+.monitor-empty-icon.large { width: 52px; height: 52px; border-radius: 15px; font-size: 25px; }
+.monitor-empty strong { color: #586c5e; font-size: 13px; font-weight: 650; }
+.monitor-empty p { max-width: 260px; margin: 0; color: #99a49b; font-size: 11px; line-height: 1.6; }
+.monitor-footnote { margin: 15px 3px 0; color: #9aa59c; font-size: 11px; }
 
 .connection-card {
   background: #fff; border: 1px solid #e3e9e4; border-radius: 18px;
@@ -222,4 +253,41 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .page-footer { padding: 15px 20px 25px; gap: 8px; font-size: 9px; }
   .preview-header { padding: 14px; }
   .preview-header h2 { font-size: 14px; }
+}
+
+@media (max-width: 1100px) {
+  .topbar { height: auto; min-height: 78px; flex-wrap: wrap; gap: 12px; padding-top: 12px; padding-bottom: 12px; }
+  .brand { order: 1; }
+  .primary-nav { order: 2; margin-left: auto; }
+  .topbar-actions { order: 3; width: 100%; justify-content: flex-end; gap: 10px; }
+  .account-context { display: none; }
+  .monitor-content { grid-template-columns: minmax(0, 1fr); }
+  .monitor-detail-card { min-height: 320px; }
+}
+
+@media (max-width: 760px) {
+  .primary-nav { order: 3; width: 100%; justify-content: stretch; }
+  .primary-nav-item { flex: 1; }
+  .topbar-actions { order: 4; width: 100%; justify-content: space-between; }
+  .monitor-area { padding: 30px 12px 20px; }
+  .monitor-heading { align-items: flex-start; padding: 0 8px 20px; }
+  .monitor-heading h1 { font-size: 27px; }
+  .monitor-heading p { font-size: 12px; line-height: 1.6; }
+  .monitor-state { padding: 7px 9px; font-size: 10px; }
+  .monitor-board { grid-template-columns: minmax(0, 1fr); }
+  .monitor-index { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: auto; }
+  .monitor-list-card { min-height: 230px; }
+  .monitor-card-heading { padding: 15px; }
+  .monitor-empty { padding: 22px 14px; }
+  .monitor-empty.compact { padding: 18px 10px; }
+  .monitor-footnote { margin-left: 8px; line-height: 1.5; }
+  .connection-form input { min-height: 44px; }
+}
+
+@media (max-width: 520px) {
+  .monitor-heading { flex-direction: column; }
+  .monitor-index { grid-template-columns: minmax(0, 1fr); }
+  .monitor-list-card { min-height: 205px; }
+  .monitor-content { grid-template-columns: minmax(0, 1fr); }
+  .monitor-detail-card { min-height: 260px; }
 }

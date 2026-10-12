@@ -23,6 +23,8 @@ export interface ModelOptions {
 }
 
 export interface ChatRequest {
+  account_id: string;
+  conversation_id: string;
   message: string;
   history: ChatTurn[];
   model?: string;

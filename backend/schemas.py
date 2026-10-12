@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, Field, StrictBool, field_validator
+from pydantic import BaseModel, Field, StrictBool, StrictStr, field_validator
 
 
 class HistoryItem(BaseModel):
@@ -26,12 +27,29 @@ class ModelOptions(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    account_id: StrictStr = Field(min_length=1, max_length=128)
+    conversation_id: UUID
     message: str = Field(min_length=1, max_length=20_000)
     history: list[HistoryItem] = Field(default_factory=list, max_length=100)
     model: str | None = Field(default=None, min_length=1, max_length=256)
     options: ModelOptions = Field(default_factory=ModelOptions)
     think: StrictBool = False
 
+    @field_validator("account_id")
+    @classmethod
+    def require_nonblank_account_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("account_id must not be blank")
+        return value
+
 
 class DownloadRequest(BaseModel):
+    account_id: StrictStr = Field(min_length=1, max_length=128)
     artifact_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+    @field_validator("account_id")
+    @classmethod
+    def require_nonblank_account_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("account_id must not be blank")
+        return value

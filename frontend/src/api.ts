@@ -106,11 +106,11 @@ export async function streamChat(
   }
 }
 
-export async function fetchArtifact(apiKey: string, artifactId: string): Promise<Blob> {
+export async function fetchArtifact(apiKey: string, artifactId: string, accountId: string): Promise<Blob> {
   const response = await fetch('/api/artifacts/download', {
     method: 'POST',
     headers: authHeaders(apiKey),
-    body: JSON.stringify({ artifact_id: artifactId }),
+    body: JSON.stringify({ artifact_id: artifactId, account_id: accountId }),
   });
   if (!response.ok) throw await responseError(response);
   return response.blob();

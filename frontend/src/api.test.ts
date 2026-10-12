@@ -28,6 +28,8 @@ describe('streamChat', () => {
     const done = vi.fn();
 
     await streamChat('my-key', {
+      account_id: 'test-account',
+      conversation_id: '550e8400-e29b-41d4-a716-446655440000',
       message: '改成 3900',
       history: [
         { role: 'user', content: '原规则 3800' },
@@ -57,6 +59,8 @@ describe('streamChat', () => {
     ], 10)));
     const callbacks = { onStatus: vi.fn(), onDelta: vi.fn(), onArtifact: vi.fn(), onDone: vi.fn() };
     await expect(streamChat('key', {
+      account_id: 'test-account',
+      conversation_id: '550e8400-e29b-41d4-a716-446655440000',
       message: '生成',
       history: [],
       options: { temperature: 0.3, top_p: 0.8, num_ctx: 16_384 },

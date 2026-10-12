@@ -53,6 +53,8 @@ describe('chat page', () => {
     vi.stubGlobal('fetch', fetchMock);
     render(<App />);
 
+    fireEvent.click(screen.getByRole('button', { name: '策略对话' }));
+    fireEvent.change(screen.getByLabelText('账号 ID'), { target: { value: 'client-a' } });
     fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'secret-key' } });
     fireEvent.click(screen.getByText('连接并读取模型'));
     await screen.findByText('从一条价格规则开始');
@@ -90,7 +92,10 @@ describe('chat page', () => {
       expect(HTMLAnchorElement.prototype.click).toHaveBeenCalled();
     });
     const downloadCalls = fetchMock.mock.calls.filter(([url]) => url === '/api/artifacts/download');
-    expect(JSON.parse((downloadCalls[1][1] as RequestInit).body as string)).toEqual({ artifact_id: artifactId });
+    expect(JSON.parse((downloadCalls[1][1] as RequestInit).body as string)).toEqual({
+      artifact_id: artifactId,
+      account_id: 'client-a',
+    });
   });
 
   it('disables model parameters while a chat request is active', async () => {
@@ -104,6 +109,8 @@ describe('chat page', () => {
     vi.stubGlobal('fetch', fetchMock);
     render(<App />);
 
+    fireEvent.click(screen.getByRole('button', { name: '策略对话' }));
+    fireEvent.change(screen.getByLabelText('账号 ID'), { target: { value: 'client-a' } });
     fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'secret-key' } });
     fireEvent.click(screen.getByText('连接并读取模型'));
     await screen.findByText('从一条价格规则开始');
