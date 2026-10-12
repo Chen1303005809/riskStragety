@@ -1,0 +1,31 @@
+"""Authentication seam; the first adapter maps one key to one account."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from secrets import compare_digest
+
+from fastapi import Header, HTTPException, Request
+
+
+@dataclass(frozen=True)
+class Principal:
+    account_id: str
+
+
+async def require_principal(
+    request: Request, authorization: str | None = Header(default=None)
+) -> Principal:
+    scheme, _, credential = (authorization or "").partition(" ")
+    expected = request.app.state.settings.api_key
+    if (
+        scheme.lower() != "bearer"
+        or not credential
+        or not compare_digest(credential.encode("utf-8"), expected.encode("utf-8"))
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="API Key 无效",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return Principal(account_id="default")
