@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from dotenv import load_dotenv
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -20,9 +22,15 @@ class Settings:
     port: int = 8765
     cors_origins: tuple[str, ...] = ()
     project_root: Path = PROJECT_ROOT
+    app_data_dir: Path | None = None
+
+    @property
+    def data_dir(self) -> Path:
+        return self.app_data_dir or (self.project_root / "data")
 
     @classmethod
     def from_env(cls) -> Settings:
+        load_dotenv(PROJECT_ROOT / ".env", override=False)
         base_url = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip().rstrip("/")
         parsed = urlsplit(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -44,6 +52,10 @@ class Settings:
             for origin in os.environ.get("CORS_ORIGINS", "").split(",")
             if origin.strip()
         )
+        configured_data_dir = os.environ.get("APP_DATA_DIR", "").strip()
+        data_dir = Path(configured_data_dir).expanduser() if configured_data_dir else None
+        if data_dir is not None and not data_dir.is_absolute():
+            data_dir = PROJECT_ROOT / data_dir
         return cls(
             ollama_base_url=base_url,
             ollama_model=model,
@@ -51,4 +63,5 @@ class Settings:
             host=os.environ.get("APP_HOST", "0.0.0.0"),
             port=port,
             cors_origins=cors_origins,
+            app_data_dir=data_dir,
         )

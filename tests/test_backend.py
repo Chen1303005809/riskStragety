@@ -95,7 +95,11 @@ def test_chat_sse_and_artifact_download(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     events = events_from(response.text)
-    assert events[0] == ("status", {"phase": "started", "model": "model-b"})
+    assert events[0] == ("status", {
+        "phase": "started",
+        "model": "model-b",
+        "conversation_id": CHAT_CONTEXT["conversation_id"],
+    })
     assert any(kind == "delta" for kind, _ in events)
     artifact = next(data for kind, data in events if kind == "artifact")
     assert events[-1][0] == "done"

@@ -60,4 +60,6 @@ class InterfaceReader(Protocol):
 
 
 class ArtifactWriter(Protocol):
-    async def create(self, filename: str, source: str, account_id: str) -> Artifact: ...
+    async def create(
+        self, filename: str, source: str, account_id: str, conversation_id: str | None = None
+    ) -> Artifact: ...

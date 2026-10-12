@@ -1,4 +1,4 @@
-"""Authentication seam; the first adapter maps one key to one account."""
+"""Bearer API key authentication for the shared service caller."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from fastapi import Header, HTTPException, Request
 
 @dataclass(frozen=True)
 class Principal:
-    account_id: str
+    """A caller authenticated with the shared service API key."""
 
 
 async def require_principal(
@@ -28,4 +28,4 @@ async def require_principal(
             detail="API Key 无效",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return Principal(account_id="default")
+    return Principal()

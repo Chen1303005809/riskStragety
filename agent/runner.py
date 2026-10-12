@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
@@ -82,6 +83,7 @@ class AgentRunner:
         history: Sequence[ChatTurn],
         model: str,
         account_id: str,
+        conversation_id: str | None = None,
         options: dict[str, int | float] | None = None,
         think: bool = False,
     ) -> AsyncIterator[AgentEvent]:
@@ -165,7 +167,7 @@ class AgentRunner:
             for call in calls:
                 yield AgentEvent("status", {"phase": "tool_started", "tool": call.name})
                 try:
-                    result, artifact = await self._call_tool(call, account_id)
+                    result, artifact = await self._call_tool(call, account_id, conversation_id)
                 except (ValueError, OSError) as exc:
                     result, artifact = {"error": str(exc)}, None
                 if artifact:
@@ -186,7 +188,7 @@ class AgentRunner:
         raise AgentError("Agent 未能完成请求")
 
     async def _call_tool(
-        self, call: ToolCall, account_id: str
+        self, call: ToolCall, account_id: str, conversation_id: str | None
     ) -> tuple[dict[str, Any], Artifact | None]:
         args = call.arguments
         if call.name == "list_interface_files":
@@ -228,6 +230,10 @@ class AgentRunner:
                 filename = filename_hint
             else:
                 raise ValueError("策略源码必须包含一个直接继承 RHTemplate 的顶层策略类")
-            artifact = await self._artifacts.create(filename, source, account_id)
+            create = self._artifacts.create
+            if "conversation_id" in inspect.signature(create).parameters:
+                artifact = await create(filename, source, account_id, conversation_id)
+            else:
+                artifact = await create(filename, source, account_id)
             return {"artifact_id": artifact.artifact_id, "filename": artifact.filename}, artifact
         raise ValueError(f"不支持的工具：{call.name}")

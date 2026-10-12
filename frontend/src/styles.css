@@ -129,6 +129,73 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .monitor-empty strong { color: #586c5e; font-size: 13px; font-weight: 650; }
 .monitor-empty p { max-width: 260px; margin: 0; color: #99a49b; font-size: 11px; line-height: 1.6; }
 .monitor-footnote { margin: 15px 3px 0; color: #9aa59c; font-size: 11px; }
+.monitor-refresh, .continue-button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: 38px; border: 1px solid #cfded2; border-radius: 9px;
+  padding: 0 13px; color: #24513d; background: #fff; font-size: 12px; font-weight: 650;
+  white-space: nowrap;
+}
+.monitor-refresh:hover, .continue-button:hover { border-color: #8eb7a6; background: #f3faf4; }
+.monitor-refresh:disabled { opacity: .6; }
+.refresh-glyph { display: inline-block; font-size: 18px; line-height: 1; }
+.refresh-glyph.spinning { animation: refresh-spin .8s linear infinite; }
+@keyframes refresh-spin { to { transform: rotate(360deg); } }
+.monitor-connection-card { max-width: 800px; margin: 22px auto 0; }
+.monitor-connection-card .connection-form { max-width: 660px; }
+.monitor-connection-card .connection-form input { min-width: 0; }
+.monitor-list { min-height: 0; flex: 1; overflow-y: auto; padding: 8px 10px 10px; }
+.monitor-list-item {
+  width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: 5px;
+  border: 1px solid transparent; border-radius: 9px; margin: 2px 0; padding: 11px 10px;
+  color: #52675b; background: transparent; text-align: left;
+}
+.monitor-list-item:hover { background: #f7faf6; }
+.monitor-list-item.selected { border-color: #cfe2d3; background: #f0f7ef; }
+.monitor-list-item strong { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #254433; font-size: 12px; font-weight: 650; }
+.monitor-list-item span, .monitor-list-item small { color: #849389; font-size: 10px; line-height: 1.45; }
+.monitor-card-heading h2 small { margin-left: 4px; color: #91a097; font-size: 11px; font-weight: 500; }
+.monitor-card-heading .monitor-state-tag { max-width: 145px; overflow: hidden; text-overflow: ellipsis; }
+.monitor-pagination { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 10px 3px 3px; color: #85948a; font-size: 10px; }
+.monitor-pagination button {
+  min-height: 28px; border: 1px solid #e1e9e1; border-radius: 6px; padding: 0 8px;
+  color: #557163; background: #fff; font-size: 10px; white-space: nowrap;
+}
+.monitor-pagination button:hover:not(:disabled) { border-color: #a8c5b1; background: #f4faf4; }
+.monitor-pagination button:disabled { color: #b3bcb5; }
+.monitor-unassigned { border-top: 1px solid #edf1ec; margin-top: 12px; padding: 12px 2px 0; }
+.monitor-subheading { display: flex; align-items: center; justify-content: space-between; margin: 0 2px 7px; color: #546b5d; font-size: 11px; }
+.monitor-subheading span { color: #8b998f; }
+.monitor-muted { margin: 8px 3px; color: #9aa69d; font-size: 10px; }
+.monitor-file-row {
+  min-width: 0; display: flex; align-items: center; gap: 8px; border: 1px solid #e8eee7;
+  border-radius: 8px; margin: 5px 0; padding: 7px; background: #fbfcfa;
+}
+.monitor-file-mark { flex: none; display: grid; place-items: center; width: 32px; height: 32px; border-radius: 7px; color: #47745e; background: #edf5ec; font-size: 9px; font-weight: 750; }
+.monitor-file-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 4px; }
+.monitor-file-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #3d5547; font-size: 10px; }
+.monitor-file-copy small { color: #96a197; font-size: 9px; }
+.monitor-file-row button { min-height: 27px; border: 1px solid #dce7dc; border-radius: 6px; padding: 0 7px; color: #517160; background: white; font-size: 9px; }
+.monitor-file-row button:hover:not(:disabled) { border-color: #9cbeaa; background: #f3faf4; }
+.compact-pagination { padding-top: 6px; }
+.monitor-detail-meta { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 12px 18px 8px; }
+.monitor-detail-meta strong { overflow: hidden; color: #365442; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.monitor-detail-meta span { flex: none; color: #8b998f; font-size: 10px; }
+.monitor-timeline { flex: 1; min-height: 0; overflow: auto; padding: 0 18px; }
+.monitor-message { border-bottom: 1px solid #eef2ed; padding: 13px 0; }
+.monitor-message:last-child { border-bottom: 0; }
+.monitor-message-head { display: flex; align-items: center; gap: 9px; color: #7a8a7f; font-size: 9px; }
+.monitor-message-head strong { color: #42624e; font-size: 10px; }
+.monitor-message-head span { margin-left: auto; }
+.monitor-message-head em { color: #829388; font-style: normal; }
+.monitor-message pre { margin: 8px 0 0; color: #405348; font: inherit; font-size: 11px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.monitor-message-user .monitor-message-head strong { color: #52745e; }
+.monitor-message-assistant .monitor-message-head strong { color: #2d6754; }
+.detail-pagination { border-top: 1px solid #edf1ec; margin: 0 15px; padding: 9px 0 12px; }
+.monitor-files-list { flex: 1; min-height: 0; overflow: auto; padding: 9px 12px 12px; }
+.monitor-files-list .monitor-empty { min-height: 230px; }
+.monitor-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 12px 2px 0; border: 1px solid #f0d6d0; border-radius: 9px; padding: 10px 12px; color: #9e4b3d; background: #fff8f6; font-size: 11px; }
+.monitor-error button { border: 1px solid #e6c5bc; border-radius: 6px; padding: 5px 8px; color: #934a3e; background: #fff; font-size: 10px; }
+.connection-key-note { display: flex; align-items: center; flex: 0 1 280px; min-height: 46px; border: 1px solid #d9e2db; border-radius: 9px; padding: 0 15px; color: #658073; background: #f4f8f3; font-size: 12px; }
 
 .connection-card {
   background: #fff; border: 1px solid #e3e9e4; border-radius: 18px;
@@ -290,4 +357,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .monitor-list-card { min-height: 205px; }
   .monitor-content { grid-template-columns: minmax(0, 1fr); }
   .monitor-detail-card { min-height: 260px; }
+  .monitor-card-heading { align-items: flex-start; }
+  .monitor-card-heading .continue-button { padding: 0 8px; font-size: 10px; }
+  .monitor-file-row { gap: 5px; padding: 6px; }
+  .monitor-file-row button { padding: 0 5px; }
+  .monitor-detail-meta { align-items: flex-start; flex-direction: column; gap: 4px; }
+  .monitor-pagination { flex-wrap: wrap; }
+  .monitor-connection-card .connection-form { align-items: stretch; }
+  .connection-key-note { min-height: 42px; flex-basis: auto; }
 }

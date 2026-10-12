@@ -1,4 +1,14 @@
-import type { Artifact, ChatRequest, DoneEvent } from './types';
+import type {
+  AccountSummary,
+  Artifact,
+  ArtifactRecord,
+  ChatRequest,
+  ConversationDetail,
+  ConversationSummary,
+  DoneEvent,
+  MonitorConversationsPage,
+  Page,
+} from './types';
 
 interface StreamCallbacks {
   onStatus: (phase: string, tool?: string) => void;
@@ -39,6 +49,93 @@ export async function fetchModels(apiKey: string): Promise<{ models: string[]; d
   };
 }
 
+async function jsonResponse<T>(response: Response): Promise<T> {
+  if (!response.ok) throw await responseError(response);
+  return await response.json() as T;
+}
+
+export async function fetchMonitorAccounts(
+  apiKey: string,
+  offset = 0,
+  limit = 50,
+): Promise<Page<AccountSummary>> {
+  const query = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+  const response = await fetch('/api/monitor/accounts?' + query, {
+    headers: authHeaders(apiKey),
+    cache: 'no-store',
+  });
+  return jsonResponse<Page<AccountSummary>>(response);
+}
+
+export async function fetchMonitorConversations(
+  apiKey: string,
+  accountId: string,
+  options: { offset?: number; limit?: number; unassignedOffset?: number; unassignedLimit?: number } = {},
+): Promise<MonitorConversationsPage> {
+  const query = new URLSearchParams({
+    offset: String(options.offset ?? 0),
+    limit: String(options.limit ?? 50),
+    unassigned_offset: String(options.unassignedOffset ?? 0),
+    unassigned_limit: String(options.unassignedLimit ?? 50),
+  });
+  const response = await fetch(
+    `/api/monitor/accounts/${encodeURIComponent(accountId)}/conversations?${query}`,
+    { headers: authHeaders(apiKey), cache: 'no-store' },
+  );
+  return jsonResponse<MonitorConversationsPage>(response);
+}
+
+export async function fetchMonitorConversation(
+  apiKey: string,
+  accountId: string,
+  conversationId: string,
+  options: { messageOffset?: number; messageLimit?: number; artifactOffset?: number; artifactLimit?: number } = {},
+): Promise<ConversationDetail> {
+  const query = new URLSearchParams({
+    message_offset: String(options.messageOffset ?? 0),
+    message_limit: String(options.messageLimit ?? 100),
+    artifact_offset: String(options.artifactOffset ?? 0),
+    artifact_limit: String(options.artifactLimit ?? 50),
+  });
+  const response = await fetch(
+    `/api/monitor/accounts/${encodeURIComponent(accountId)}/conversations/${encodeURIComponent(conversationId)}?${query}`,
+    { headers: authHeaders(apiKey), cache: 'no-store' },
+  );
+  return jsonResponse<ConversationDetail>(response);
+}
+
+export async function fetchConversationForChat(
+  apiKey: string,
+  accountId: string,
+  conversationId: string,
+): Promise<{ conversation: ConversationSummary; messages: ConversationDetail['messages']; artifacts: ArtifactRecord[] }> {
+  const first = await fetchMonitorConversation(apiKey, accountId, conversationId, {
+    messageOffset: 0,
+    messageLimit: 200,
+    artifactOffset: 0,
+    artifactLimit: 100,
+  });
+  const messages = [...first.messages];
+  const artifacts = [...first.artifacts];
+  for (let offset = messages.length; offset < first.message_total; offset += first.message_limit) {
+    const page = await fetchMonitorConversation(apiKey, accountId, conversationId, {
+      messageOffset: offset,
+      messageLimit: first.message_limit,
+      artifactLimit: 1,
+    });
+    messages.push(...page.messages);
+  }
+  for (let offset = artifacts.length; offset < first.artifact_total; offset += first.artifact_limit) {
+    const page = await fetchMonitorConversation(apiKey, accountId, conversationId, {
+      artifactOffset: offset,
+      artifactLimit: first.artifact_limit,
+      messageLimit: 1,
+    });
+    artifacts.push(...page.artifacts);
+  }
+  return { conversation: first.conversation, messages, artifacts };
+}
+
 function handleFrame(frame: string, callbacks: StreamCallbacks): boolean {
   const lines = frame.split(/\r?\n/);
   const event = lines.find((line) => line.startsWith('event:'))?.slice(6).trim();
@@ -72,10 +169,12 @@ export async function streamChat(
   callbacks: StreamCallbacks,
   signal: AbortSignal,
 ): Promise<void> {
+  const requestBody = { ...request };
+  delete requestBody.history;
   const response = await fetch('/api/agent/chat/stream', {
     method: 'POST',
     headers: { ...authHeaders(apiKey), Accept: 'text/event-stream' },
-    body: JSON.stringify(request),
+    body: JSON.stringify(requestBody),
     signal,
   });
   if (!response.ok) throw await responseError(response);
