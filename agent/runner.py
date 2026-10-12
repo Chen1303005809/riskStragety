@@ -82,7 +82,14 @@ class AgentRunner:
         history: Sequence[ChatTurn],
         model: str,
         account_id: str,
+        options: dict[str, int | float] | None = None,
+        think: bool = False,
     ) -> AsyncIterator[AgentEvent]:
+        model_options = options if options is not None else {
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "num_ctx": 16_384,
+        }
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": build_system_prompt()},
             *({"role": turn.role, "content": turn.content} for turn in history),
@@ -96,7 +103,13 @@ class AgentRunner:
             round_content: list[str] = []
             calls: list[ToolCall] = []
             usage: dict[str, int] = {}
-            async for chunk in self._model.stream_chat(model, messages, TOOL_SCHEMAS):
+            async for chunk in self._model.stream_chat(
+                model,
+                messages,
+                TOOL_SCHEMAS,
+                options=model_options,
+                think=think,
+            ):
                 if chunk.content:
                     round_content.append(chunk.content)
                     visible_content.append(chunk.content)

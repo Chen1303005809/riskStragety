@@ -50,6 +50,32 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   border: 1px solid #d9e2db; border-radius: 8px; color: #183127;
   padding: 0 32px 0 11px; background: #fafcf9;
 }
+.model-settings { position: relative; }
+.model-settings summary {
+  list-style: none; height: 37px; display: flex; align-items: center;
+  border: 1px solid #d9e2db; border-radius: 8px; color: #315546;
+  background: #fafcf9; padding: 0 12px; font-size: 12px; white-space: nowrap;
+}
+.model-settings summary::-webkit-details-marker { display: none; }
+.model-settings summary::after { content: "⌄"; margin-left: 8px; color: #789084; }
+.model-settings[open] summary { border-color: #9cbca8; background: #f4faf5; }
+.model-settings-panel {
+  position: absolute; z-index: 5; top: calc(100% + 12px); right: 0;
+  width: min(320px, calc(100vw - 32px)); padding: 17px;
+  border: 1px solid #dce7dc; border-radius: 12px; background: #fff;
+  box-shadow: 0 16px 45px #193b281f; color: #294437;
+}
+.model-settings-panel > strong { display: block; margin-bottom: 13px; font-size: 13px; }
+.model-settings-panel > label:not(.model-setting-toggle) {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin-top: 10px; color: #65776d; font-size: 12px;
+}
+.model-settings-panel input[type="number"] {
+  width: 116px; height: 34px; border: 1px solid #d9e2db; border-radius: 7px;
+  background: #fbfdfb; color: #183127; padding: 0 9px;
+}
+.model-setting-toggle { display: flex; align-items: center; gap: 8px; color: #52695c; font-size: 12px; }
+.model-setting-toggle input { accent-color: #146650; }
 .connected, .offline { font-size: 12px; color: #527465; white-space: nowrap; }
 .offline { color: #9a9f96; }
 .connected-dot, .pulse-dot {

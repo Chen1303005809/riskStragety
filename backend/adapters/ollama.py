@@ -27,10 +27,21 @@ class OllamaModelGateway:
         return sorted({name for name in names if isinstance(name, str) and name})
 
     async def stream_chat(
-        self, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        options: dict[str, int | float],
+        think: bool,
     ) -> AsyncIterator[ModelChunk]:
         stream = await self._client.chat(
-            model=model, messages=messages, tools=tools, stream=True
+            model=model,
+            messages=messages,
+            tools=tools,
+            stream=True,
+            options=options,
+            think=think,
         )
         async for item in stream:
             message = item.message

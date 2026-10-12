@@ -56,6 +56,11 @@ describe('chat page', () => {
     fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'secret-key' } });
     fireEvent.click(screen.getByText('连接并读取模型'));
     await screen.findByText('从一条价格规则开始');
+    fireEvent.click(screen.getByText('模型参数'));
+    fireEvent.change(screen.getByLabelText('上下文长度'), { target: { value: '32768' } });
+    fireEvent.change(screen.getByLabelText('Temperature'), { target: { value: '0.55' } });
+    fireEvent.change(screen.getByLabelText('Top P'), { target: { value: '0.9' } });
+    fireEvent.click(screen.getByLabelText('启用思考模式'));
 
     fireEvent.change(screen.getByLabelText('输入策略需求'), { target: { value: '螺纹钢预警' } });
     fireEvent.click(screen.getByText(/发送需求/));
@@ -69,6 +74,8 @@ describe('chat page', () => {
     const chatCalls = fetchMock.mock.calls.filter(([url]) => url === '/api/agent/chat/stream');
     const request = JSON.parse((chatCalls[1][1] as RequestInit).body as string);
     expect(request.model).toBe('model-b');
+    expect(request.options).toEqual({ temperature: 0.55, top_p: 0.9, num_ctx: 32768 });
+    expect(request.think).toBe(true);
     expect(request.history).toEqual([
       { role: 'user', content: '螺纹钢预警' },
       { role: 'assistant', content: '请补充阈值。' },
@@ -84,5 +91,28 @@ describe('chat page', () => {
     });
     const downloadCalls = fetchMock.mock.calls.filter(([url]) => url === '/api/artifacts/download');
     expect(JSON.parse((downloadCalls[1][1] as RequestInit).body as string)).toEqual({ artifact_id: artifactId });
+  });
+
+  it('disables model parameters while a chat request is active', async () => {
+    let resolveChat!: (response: Response) => void;
+    const pendingChat = new Promise<Response>((resolve) => { resolveChat = resolve; });
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url === '/api/models') return Promise.resolve(Response.json({ models: ['model-a'], default_model: 'model-a' }));
+      if (url === '/api/agent/chat/stream') return pendingChat;
+      throw new Error('unexpected URL: ' + url);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+
+    fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'secret-key' } });
+    fireEvent.click(screen.getByText('连接并读取模型'));
+    await screen.findByText('从一条价格规则开始');
+    fireEvent.change(screen.getByLabelText('输入策略需求'), { target: { value: '生成策略' } });
+    fireEvent.click(screen.getByText(/发送需求/));
+
+    await waitFor(() => expect((screen.getByLabelText('Temperature') as HTMLInputElement).disabled).toBe(true));
+    expect((screen.getByLabelText('启用思考模式') as HTMLInputElement).disabled).toBe(true);
+    resolveChat(streamReply('等待完成。'));
+    await screen.findByText('等待完成。');
   });
 });

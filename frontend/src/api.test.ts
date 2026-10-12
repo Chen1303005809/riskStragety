@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { streamChat } from './api';
+import { parsePythonFile, streamChat } from './api';
 
 function sseResponse(frames: string[], splitAt: number): Response {
   const raw = new TextEncoder().encode(frames.join(''));
@@ -34,6 +34,8 @@ describe('streamChat', () => {
         { role: 'assistant', content: '原策略已生成' },
       ],
       model: 'm',
+      options: { temperature: 0.3, top_p: 0.8, num_ctx: 16_384 },
+      think: false,
     }, { onStatus: status, onDelta: delta, onArtifact: artifact, onDone: done }, new AbortController().signal);
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -54,7 +56,23 @@ describe('streamChat', () => {
       'event: delta\ndata: {"text":"partial"}\n\n',
     ], 10)));
     const callbacks = { onStatus: vi.fn(), onDelta: vi.fn(), onArtifact: vi.fn(), onDone: vi.fn() };
-    await expect(streamChat('key', { message: '生成', history: [] }, callbacks, new AbortController().signal))
+    await expect(streamChat('key', {
+      message: '生成',
+      history: [],
+      options: { temperature: 0.3, top_p: 0.8, num_ctx: 16_384 },
+      think: false,
+    }, callbacks, new AbortController().signal))
       .rejects.toThrow('提前结束');
+  });
+
+  it('decodes UTF-8 artifact bytes and creates a Python file', async () => {
+    const source = '# 价格预警\nthreshold = 3900\n';
+    const bytes = new TextEncoder().encode(source).buffer;
+    const file = parsePythonFile(bytes, '价格策略');
+
+    expect(file.name).toBe('价格策略.py');
+    expect(file.type).toBe('text/x-python;charset=utf-8');
+    await expect(file.text()).resolves.toBe(source);
+    expect(new Uint8Array(await file.arrayBuffer())).toEqual(new TextEncoder().encode(source));
   });
 });

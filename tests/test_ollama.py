@@ -47,7 +47,13 @@ def test_ollama_list_and_stream_conversion() -> None:
 
     async def scenario():
         names = await gateway.list_models()
-        chunks = [chunk async for chunk in gateway.stream_chat("model-a", [{"role": "user", "content": "hi"}], [])]
+        chunks = [chunk async for chunk in gateway.stream_chat(
+            "model-a",
+            [{"role": "user", "content": "hi"}],
+            [],
+            options={"temperature": 0.4, "top_p": 0.9, "num_ctx": 32_768},
+            think=True,
+        )]
         await gateway.close()
         return names, chunks
 
@@ -55,6 +61,8 @@ def test_ollama_list_and_stream_conversion() -> None:
     assert names == ["model-a", "model-b"]
     assert seen["model"] == "model-a"
     assert seen["stream"] is True
+    assert seen["options"] == {"temperature": 0.4, "top_p": 0.9, "num_ctx": 32_768}
+    assert seen["think"] is True
     assert chunks[0].content == "正在读取"
     assert chunks[0].tool_calls == (ToolCall("read_interface_file", {"filename": "external_head.py"}),)
     assert chunks[1].usage == {"prompt_tokens": 12, "completion_tokens": 4}

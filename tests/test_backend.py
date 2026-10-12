@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
 from agent.contracts import ModelChunk, ToolCall
-from backend.app import create_app
+from backend.app import ARTIFACT_STREAM_CHUNK_SIZE, _artifact_chunks, create_app
 from backend.config import Settings
 
 
@@ -21,12 +21,22 @@ AUTH = {"Authorization": f"Bearer {KEY}"}
 
 
 class WorkingModel:
+    def __init__(self) -> None:
+        self.settings_seen: list[tuple[dict[str, int | float], bool]] = []
+
     async def list_models(self) -> list[str]:
         return ["model-a", "model-b"]
 
     async def stream_chat(
-        self, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        options: dict[str, int | float],
+        think: bool,
     ) -> AsyncIterator[ModelChunk]:
+        self.settings_seen.append((options.copy(), think))
         if messages[-1]["role"] == "user":
             yield ModelChunk(tool_calls=(ToolCall("write_generated_file", {
                 "filename": "策略.py", "source": "threshold = 3900\n"
@@ -69,7 +79,8 @@ def test_authentication_and_model_list(tmp_path: Path) -> None:
 
 
 def test_chat_sse_and_artifact_download(tmp_path: Path) -> None:
-    client = client_for(tmp_path)
+    model = WorkingModel()
+    client = client_for(tmp_path, model)
     response = client.post("/api/agent/chat/stream", headers=AUTH, json={
         "message": "生成策略", "history": [
             {"role": "user", "content": "原规则"},
@@ -85,14 +96,30 @@ def test_chat_sse_and_artifact_download(tmp_path: Path) -> None:
     assert events[-1][0] == "done"
     assert events[-1][1]["artifacts"] == [artifact]
     assert len(artifact["artifact_id"]) == 32
+    assert model.settings_seen == [
+        ({"temperature": 0.3, "top_p": 0.8, "num_ctx": 16_384}, False),
+        ({"temperature": 0.3, "top_p": 0.8, "num_ctx": 16_384}, False),
+    ]
 
     download = client.post("/api/artifacts/download", headers=AUTH, json={
         "artifact_id": artifact["artifact_id"]
     })
     assert download.status_code == 200
     assert download.content == b"threshold = 3900\n"
+    assert download.headers["content-type"] == "application/octet-stream"
+    assert "content-length" not in download.headers
     assert "filename*=UTF-8''" in download.headers["content-disposition"]
     assert (tmp_path / "artifacts" / f"{artifact['artifact_id']}.py").is_file()
+
+
+def test_artifact_chunker_sends_bounded_binary_chunks() -> None:
+    content = bytes(range(256)) * (ARTIFACT_STREAM_CHUNK_SIZE // 256 + 3)
+    chunks = list(_artifact_chunks(content))
+
+    assert len(chunks) == 2
+    assert len(chunks[0]) == ARTIFACT_STREAM_CHUNK_SIZE
+    assert len(chunks[1]) == len(content) - ARTIFACT_STREAM_CHUNK_SIZE
+    assert b"".join(chunks) == content
 
 
 def test_download_rejects_bad_id_missing_file_and_other_owner(tmp_path: Path) -> None:
@@ -120,7 +147,7 @@ def test_model_unavailable_and_stream_failure_are_reported(tmp_path: Path) -> No
         async def list_models(self):
             raise ConnectionError("offline")
 
-        async def stream_chat(self, model, messages, tools):
+        async def stream_chat(self, model, messages, tools, *, options, think):
             yield ModelChunk(content="partial")
             raise ConnectionError("Ollama offline")
 
@@ -140,12 +167,56 @@ def test_request_schema_rejects_invalid_history(tmp_path: Path) -> None:
     assert response.status_code == 422
 
 
+def test_chat_accepts_custom_model_options_and_think(tmp_path: Path) -> None:
+    class CapturingModel:
+        def __init__(self) -> None:
+            self.settings_seen: list[tuple[dict[str, int | float], bool]] = []
+
+        async def list_models(self) -> list[str]:
+            return ["model-a"]
+
+        async def stream_chat(self, model, messages, tools, *, options, think):
+            self.settings_seen.append((options.copy(), think))
+            yield ModelChunk(content="【参数补充请求】请补充交易所和合约代码。")
+
+    model = CapturingModel()
+    client = client_for(tmp_path, model)
+    response = client.post("/api/agent/chat/stream", headers=AUTH, json={
+        "message": "螺纹钢突破时提醒",
+        "options": {"temperature": 0.55, "top_p": 0.9, "num_ctx": 32_768},
+        "think": True,
+    })
+    assert response.status_code == 200
+    assert model.settings_seen == [
+        ({"temperature": 0.55, "top_p": 0.9, "num_ctx": 32_768}, True)
+    ]
+
+
+def test_chat_rejects_invalid_model_options_and_think(tmp_path: Path) -> None:
+    model = WorkingModel()
+    client = client_for(tmp_path, model)
+    invalid_payloads = [
+        {"options": {"temperature": -0.01}},
+        {"options": {"temperature": "0.3"}},
+        {"options": {"top_p": 1.01}},
+        {"options": {"num_ctx": 511}},
+        {"options": {"num_ctx": 16_384.5}},
+        {"think": "true"},
+    ]
+    for fields in invalid_payloads:
+        response = client.post("/api/agent/chat/stream", headers=AUTH, json={
+            "message": "生成策略", **fields
+        })
+        assert response.status_code == 422
+    assert model.settings_seen == []
+
+
 def test_concurrent_sse_requests_have_distinct_history_and_artifacts(tmp_path: Path) -> None:
     class ParallelModel:
         async def list_models(self):
             return ["model-a"]
 
-        async def stream_chat(self, model, messages, tools):
+        async def stream_chat(self, model, messages, tools, *, options, think):
             user = next(item["content"] for item in messages if item["role"] == "user")
             await asyncio.sleep(0.001)
             if messages[-1]["role"] == "user":

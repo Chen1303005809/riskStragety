@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
-import { fetchArtifact, fetchModels, streamChat } from './api';
-import type { Artifact, ChatMessage, ChatTurn } from './types';
+import { decodeArtifactSource, fetchArtifact, fetchModels, parsePythonFile, streamChat } from './api';
+import type { Artifact, ChatMessage, ChatTurn, ModelOptions } from './types';
 
 function RichText({ content }: { content: string }) {
   const parts = content.split(/(\x60{3}[\s\S]*?\x60{3})/g);
@@ -46,6 +46,12 @@ export default function App() {
   const [keyDraft, setKeyDraft] = useState('');
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState('');
+  const [modelOptions, setModelOptions] = useState<ModelOptions>({
+    temperature: 0.3,
+    top_p: 0.8,
+    num_ctx: 16_384,
+  });
+  const [think, setThink] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [connectionError, setConnectionError] = useState('');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -66,6 +72,17 @@ export default function App() {
 
   function updateAssistant(id: string, change: Partial<ChatMessage>) {
     commitMessages(messagesRef.current.map((item) => item.id === id ? { ...item, ...change } : item));
+  }
+
+  function updateModelOption(key: keyof ModelOptions, raw: string) {
+    if (!raw.trim()) return;
+    const value = Number(raw);
+    const valid = Number.isFinite(value) && (
+      key === 'temperature' ? value >= 0 && value <= 2
+        : key === 'top_p' ? value >= 0 && value <= 1
+          : Number.isInteger(value) && value >= 512 && value <= 131_072
+    );
+    if (valid) setModelOptions((current) => ({ ...current, [key]: value }));
   }
 
   useEffect(() => {
@@ -130,7 +147,7 @@ export default function App() {
     abortRef.current = controller;
 
     try {
-      await streamChat(apiKey, { message, history, model }, {
+      await streamChat(apiKey, { message, history, model, options: modelOptions, think }, {
         onStatus: (phase, tool) => setActivity(activityText(phase, tool)),
         onDelta: (text) => {
           const current = messagesRef.current.find((item) => item.id === assistant.id);
@@ -178,7 +195,7 @@ export default function App() {
     setNotice('');
     try {
       const blob = await fetchArtifact(apiKey, artifact.artifact_id);
-      setPreview({ artifact, source: await blob.text() });
+      setPreview({ artifact, source: decodeArtifactSource(await blob.arrayBuffer()) });
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '无法读取生成文件');
     } finally {
@@ -191,10 +208,11 @@ export default function App() {
     setNotice('');
     try {
       const blob = await fetchArtifact(apiKey, artifact.artifact_id);
-      const url = URL.createObjectURL(blob);
+      const file = parsePythonFile(await blob.arrayBuffer(), artifact.filename);
+      const url = URL.createObjectURL(file);
       const anchor = document.createElement('a');
       anchor.href = url;
-      anchor.download = artifact.filename;
+      anchor.download = file.name;
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
@@ -225,6 +243,60 @@ export default function App() {
                   {models.map((name) => <option key={name} value={name}>{name}</option>)}
                 </select>
               </label>
+              <details className="model-settings">
+                <summary>模型参数</summary>
+                <div className="model-settings-panel">
+                  <strong>生成参数</strong>
+                  <label className="model-setting-toggle">
+                    <input
+                      type="checkbox"
+                      checked={think}
+                      onChange={(event) => setThink(event.target.checked)}
+                      disabled={busy}
+                    />
+                    <span>启用思考模式</span>
+                  </label>
+                  <label>
+                    <span>上下文长度</span>
+                    <input
+                      aria-label="上下文长度"
+                      type="number"
+                      min={512}
+                      max={131_072}
+                      step={512}
+                      value={modelOptions.num_ctx}
+                      onChange={(event) => updateModelOption('num_ctx', event.target.value)}
+                      disabled={busy}
+                    />
+                  </label>
+                  <label>
+                    <span>Temperature</span>
+                    <input
+                      aria-label="Temperature"
+                      type="number"
+                      min={0}
+                      max={2}
+                      step={0.05}
+                      value={modelOptions.temperature}
+                      onChange={(event) => updateModelOption('temperature', event.target.value)}
+                      disabled={busy}
+                    />
+                  </label>
+                  <label>
+                    <span>Top P</span>
+                    <input
+                      aria-label="Top P"
+                      type="number"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={modelOptions.top_p}
+                      onChange={(event) => updateModelOption('top_p', event.target.value)}
+                      disabled={busy}
+                    />
+                  </label>
+                </div>
+              </details>
               <span className="connected"><span className="connected-dot" /> 已连接</span>
               <button className="quiet-button" type="button" onClick={disconnect}>退出</button>
             </>

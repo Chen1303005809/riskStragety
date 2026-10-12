@@ -115,3 +115,14 @@ export async function fetchArtifact(apiKey: string, artifactId: string): Promise
   if (!response.ok) throw await responseError(response);
   return response.blob();
 }
+
+export function decodeArtifactSource(bytes: ArrayBuffer): string {
+  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+}
+
+export function parsePythonFile(bytes: ArrayBuffer, filename: string): File {
+  // Validate UTF-8 while preserving the original bytes in the downloaded file.
+  new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  const name = filename.toLowerCase().endsWith('.py') ? filename : `${filename}.py`;
+  return new File([bytes], name, { type: 'text/x-python;charset=utf-8' });
+}

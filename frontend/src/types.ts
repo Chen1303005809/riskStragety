@@ -16,10 +16,18 @@ export interface ChatMessage extends ChatTurn {
   artifacts: Artifact[];
 }
 
+export interface ModelOptions {
+  temperature: number;
+  top_p: number;
+  num_ctx: number;
+}
+
 export interface ChatRequest {
   message: string;
   history: ChatTurn[];
   model?: string;
+  options: ModelOptions;
+  think: boolean;
 }
 
 export interface DoneEvent {

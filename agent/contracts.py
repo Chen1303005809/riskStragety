@@ -41,7 +41,13 @@ class AgentEvent:
 
 class ModelGateway(Protocol):
     def stream_chat(
-        self, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        options: dict[str, int | float],
+        think: bool,
     ) -> AsyncIterator[ModelChunk]: ...
 
     async def list_models(self) -> list[str]: ...

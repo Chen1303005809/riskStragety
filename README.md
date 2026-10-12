@@ -49,8 +49,10 @@ python -m backend
 curl -N http://127.0.0.1:8765/api/agent/chat/stream \
   -H "Authorization: Bearer $AGENT_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"message":"SHFE rb2710 超过 3900 时预警","history":[],"model":"qwen3:8b"}'
+  -d '{"message":"SHFE rb2710 超过 3900 时预警","history":[],"model":"qwen3:8b","options":{"temperature":0.3,"top_p":0.8,"num_ctx":16384},"think":false}'
 ```
+
+`options.temperature` 范围为 `0–2`，`options.top_p` 范围为 `0–1`，`options.num_ctx` 范围为 `512–131072` 的整数。省略 `options` 或 `think` 时分别使用 `0.3`、`0.8`、`16384` 和 `false`。
 
 `POST /api/agent/chat/stream` 返回 `text/event-stream`：
 
@@ -77,7 +79,13 @@ curl -X POST http://127.0.0.1:8765/api/artifacts/download \
   -o strategy.py
 ```
 
-下载接口按 `artifact_id` 查找文件，并核对当前账户身份。文件名只允许直接的 `.py` 文件名；接口读取和产物下载都拒绝路径穿越及符号链接。人工清理时可按 ID 删除 `artifacts/` 下对应的 `.py` 与 `.json` 文件。
+下载接口按 `artifact_id` 查找文件，并核对当前账户身份。成功响应以 `application/octet-stream` 分块发送原始 UTF-8 文件字节，并通过 `Content-Disposition` 提供 `.py` 文件名；浏览器客户端可读取响应字节并生成 `.py` 文件。文件名只允许直接的 `.py` 文件名；接口读取和产物下载都拒绝路径穿越及符号链接。人工清理时可按 ID 删除 `artifacts/` 下对应的 `.py` 与 `.json` 文件。
+
+Python 客户端示例见 [`examples/download_artifact_client.py`](examples/download_artifact_client.py)，它会分块接收二进制响应并增量解码为 UTF-8 源码文本。
+
+```bash
+.venv/bin/python3.12 examples/download_artifact_client.py
+```
 
 ## 验收
 

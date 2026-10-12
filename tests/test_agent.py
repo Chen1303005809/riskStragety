@@ -39,14 +39,18 @@ class ScriptedModel:
     def __init__(self, rounds: list[list[ModelChunk]]) -> None:
         self.rounds = rounds
         self.seen: list[list[dict[str, Any]]] = []
+        self.settings_seen: list[tuple[dict[str, int | float], bool]] = []
 
     async def list_models(self) -> list[str]:
         return ["model-a"]
 
-    async def stream_chat(self, model, messages, tools) -> AsyncIterator[ModelChunk]:
+    async def stream_chat(
+        self, model, messages, tools, *, options, think
+    ) -> AsyncIterator[ModelChunk]:
         assert model == "model-a"
         assert len(tools) == 3
         self.seen.append(messages.copy())
+        self.settings_seen.append((options.copy(), think))
         for chunk in self.rounds[len(self.seen) - 1]:
             yield chunk
 
@@ -85,6 +89,8 @@ def test_read_write_reply_flow() -> None:
         history=[],
         model="model-a",
         account_id="alice",
+        options={"temperature": 0.55, "top_p": 0.9, "num_ctx": 32_768},
+        think=True,
     )
     assert interfaces.reads == ["external_head.py"]
     assert artifacts.created == [("risk.py", source, "alice")]
@@ -96,6 +102,9 @@ def test_read_write_reply_flow() -> None:
     assert "external_head.py" in model.seen[1][-1]["content"]
     assert model.seen[2][-1]["role"] == "tool"
     assert "RHTemplate" in model.seen[2][-1]["content"]
+    assert model.settings_seen == [
+        ({"temperature": 0.55, "top_p": 0.9, "num_ctx": 32_768}, True)
+    ] * 4
 
 
 def test_missing_parameters_ask_without_creating_file() -> None:
@@ -176,7 +185,7 @@ def test_concurrent_runs_keep_messages_and_artifacts_separate() -> None:
         async def list_models(self):
             return ["model-a"]
 
-        async def stream_chat(self, model, messages, tools):
+        async def stream_chat(self, model, messages, tools, *, options, think):
             user_message = next(item["content"] for item in messages if item["role"] == "user")
             await asyncio.sleep(0.001)
             if messages[-1]["role"] == "user":
@@ -219,7 +228,7 @@ def test_cancelling_a_running_request_closes_the_model_stream() -> None:
             async def list_models(self):
                 return ["model-a"]
 
-            async def stream_chat(self, model, messages, tools):
+            async def stream_chat(self, model, messages, tools, *, options, think):
                 try:
                     yield ModelChunk(content="partial")
                     entered.set()

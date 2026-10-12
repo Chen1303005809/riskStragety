@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from urllib.parse import quote
 
@@ -20,6 +21,14 @@ from backend.adapters.ollama import OllamaModelGateway
 from backend.config import Settings
 from backend.schemas import ChatRequest, DownloadRequest
 from backend.security import Principal, require_principal
+
+
+ARTIFACT_STREAM_CHUNK_SIZE = 64 * 1024
+
+
+def _artifact_chunks(content: bytes) -> Iterator[bytes]:
+    for start in range(0, len(content), ARTIFACT_STREAM_CHUNK_SIZE):
+        yield content[start : start + ARTIFACT_STREAM_CHUNK_SIZE]
 
 
 def _sse(event: AgentEvent) -> bytes:
@@ -91,6 +100,8 @@ def create_app(
                     history=history,
                     model=selected_model,
                     account_id=principal.account_id,
+                    options=payload.options.model_dump(),
+                    think=payload.think,
                 ):
                     yield _sse(event)
             except asyncio.CancelledError:
@@ -107,13 +118,14 @@ def create_app(
     @app.post("/api/artifacts/download")
     async def download(
         payload: DownloadRequest, principal: Principal = Depends(require_principal)
-    ) -> Response:
+    ) -> StreamingResponse:
         try:
             artifact = await artifacts.read(payload.artifact_id, principal.account_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="产物不存在") from exc
-        return Response(
-            content=artifact.content,
+
+        return StreamingResponse(
+            _artifact_chunks(artifact.content),
             media_type="application/octet-stream",
             headers={
                 "Content-Disposition": _attachment_header(artifact.filename),
