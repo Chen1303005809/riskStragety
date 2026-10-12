@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import codecs
 import json
 import sys
@@ -12,6 +13,23 @@ from urllib.request import Request, urlopen
 
 
 CHUNK_SIZE = 64 * 1024
+
+
+def strategy_filename(source: str) -> str:
+    """Derive the .py filename from the strategy class in the decoded source."""
+    source_tree = ast.parse(source)
+    strategy_classes = [
+        node
+        for node in source_tree.body
+        if isinstance(node, ast.ClassDef)
+        and any(
+            isinstance(base, ast.Name) and base.id == "RHTemplate"
+            for base in node.bases
+        )
+    ]
+    if len(strategy_classes) != 1:
+        raise ValueError("源码必须包含且只包含一个直接继承 RHTemplate 的顶层策略类")
+    return f"{strategy_classes[0].name}.py"
 
 
 def download_artifact_source(base_url: str, api_key: str, artifact_id: str) -> str:
@@ -54,11 +72,11 @@ if __name__ == "__main__":
     base_url = "http://127.0.0.1:8765"
     api_key = ""
     artifact_id = ""
-    output_path = Path("strategy.py")
 
     try:
         source = download_artifact_source(base_url, api_key, artifact_id)
-    except (OSError, RuntimeError) as error:
+        output_path = Path(strategy_filename(source))
+    except (OSError, RuntimeError, SyntaxError, ValueError) as error:
         print(error, file=sys.stderr)
         raise SystemExit(1) from error
 

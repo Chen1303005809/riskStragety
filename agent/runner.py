@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
@@ -44,14 +45,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "write_generated_file",
-            "description": "把完成的 Python 策略保存为新的可下载文件；不得用于参数追问轮。",
+            "description": "把完成的 Python 策略保存为新的可下载文件；根据 source 中继承 RHTemplate 的策略类名自动命名；不得用于参数追问轮。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "filename": {"type": "string", "description": "下载时显示的纯 .py 文件名"},
                     "source": {"type": "string", "description": "完整 Python 源码"},
                 },
-                "required": ["filename", "source"],
+                "required": ["source"],
             },
         },
     },
@@ -197,9 +197,37 @@ class AgentRunner:
                 raise ValueError("filename 必须是文件名字符串")
             return {"filename": filename, "source": await self._interfaces.read_file(filename)}, None
         if call.name == "write_generated_file":
-            filename, source = args.get("filename"), args.get("source")
-            if not isinstance(filename, str) or not isinstance(source, str):
-                raise ValueError("filename 和 source 必须是字符串")
+            source, filename_hint = args.get("source"), args.get("filename")
+            if not isinstance(source, str):
+                raise ValueError("source 必须是字符串")
+            try:
+                source_tree = ast.parse(source)
+            except SyntaxError as exc:
+                if not isinstance(filename_hint, str):
+                    raise ValueError(f"策略源码语法无效，无法确定策略类名：{exc.msg}") from exc
+                source_tree = None
+            strategy_classes = (
+                [
+                    node
+                    for node in source_tree.body
+                    if isinstance(node, ast.ClassDef)
+                    and any(
+                        isinstance(base, ast.Name) and base.id == "RHTemplate"
+                        for base in node.bases
+                    )
+                ]
+                if source_tree is not None
+                else []
+            )
+            if len(strategy_classes) > 1:
+                raise ValueError("策略源码只能包含一个直接继承 RHTemplate 的顶层策略类")
+            if strategy_classes:
+                filename = f"{strategy_classes[0].name}.py"
+            elif isinstance(filename_hint, str):
+                # 兼容不含 Agent 策略类的旧式工具调用；策略生成流程由上方类名自动命名。
+                filename = filename_hint
+            else:
+                raise ValueError("策略源码必须包含一个直接继承 RHTemplate 的顶层策略类")
             artifact = await self._artifacts.create(filename, source, account_id)
             return {"artifact_id": artifact.artifact_id, "filename": artifact.filename}, artifact
         raise ValueError(f"不支持的工具：{call.name}")
