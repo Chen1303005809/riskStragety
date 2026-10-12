@@ -16,12 +16,13 @@
 
 ## 本地启动
 
-需要 Python 3.12、Node.js 20+，以及一个支持工具调用的 Ollama 模型。先安装并启动 Ollama、拉取所选模型；模型名称以 `GET /api/models` 实际返回为准。
+需要 Conda、Node.js 20+，以及一个支持工具调用的 Ollama 模型。先安装并启动 Ollama、拉取所选模型；模型名称以 `GET /api/models` 实际返回为准。
 
 ```bash
+conda create -n risk-agent python=3.12 -y
+conda activate risk-agent
 cd /Users/eurus/Code/风控客制平台
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -e .
+python -m pip install -r requirements.txt
 cd frontend
 npm ci
 npm run build
@@ -35,7 +36,7 @@ cp .env.example .env
 set -a
 source .env
 set +a
-.venv/bin/python -m backend
+python -m backend
 ```
 
 在浏览器打开 `http://<服务所在主机>:8765/`，输入同一个 API Key。前端开发时，在两个终端分别启动后端和 `cd frontend && npm run dev`；Vite 会将 `/api` 代理到本机的 8765 端口。生产部署时，请限制服务仅在可信局域网可达；跨网访问可在前面加 HTTPS 反向代理。
@@ -81,8 +82,9 @@ curl -X POST http://127.0.0.1:8765/api/artifacts/download \
 ## 验收
 
 ```bash
-.venv/bin/python -m pip install -e '.[test]'
-.venv/bin/python -m pytest -q
+conda activate risk-agent
+python -m pip install 'pytest>=8,<10' 'httpx>=0.27,<1'
+python -m pytest -q
 cd frontend
 npm run test
 npm run build
