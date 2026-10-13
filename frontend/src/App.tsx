@@ -23,6 +23,21 @@ import type {
   Page,
 } from './types';
 
+function createUuid(): string {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi.randomUUID === 'function') {
+    return cryptoApi.randomUUID();
+  }
+
+  // randomUUID() is unavailable in insecure contexts such as HTTP on a LAN IP.
+  // getRandomValues() remains available there, so use it to build an RFC 4122 v4 UUID.
+  const bytes = cryptoApi.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function RichText({ content }: { content: string }) {
   const parts = content.split(/(\x60{3}[\s\S]*?\x60{3})/g);
   return (
@@ -58,7 +73,7 @@ function activityText(phase: string, tool?: string): string {
 }
 
 function makeMessage(role: ChatMessage['role'], content: string, status: ChatMessage['status']): ChatMessage {
-  return { id: crypto.randomUUID(), role, content, status, artifacts: [] };
+  return { id: createUuid(), role, content, status, artifacts: [] };
 }
 
 interface MonitorDashboardProps {
@@ -410,7 +425,7 @@ export default function App() {
   const [keyDraft, setKeyDraft] = useState('');
   const [accountId, setAccountId] = useState('');
   const [accountIdDraft, setAccountIdDraft] = useState('');
-  const [conversationId, setConversationId] = useState(() => crypto.randomUUID());
+  const [conversationId, setConversationId] = useState(() => createUuid());
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState('');
   const [modelOptions, setModelOptions] = useState<ModelOptions>({
@@ -493,7 +508,7 @@ export default function App() {
     setAccountIdDraft('');
     setModels([]);
     setModel('');
-    setConversationId(crypto.randomUUID());
+    setConversationId(createUuid());
     setPreview(null);
     commitMessages([]);
     setNotice('');
@@ -502,7 +517,7 @@ export default function App() {
   function newConversation() {
     if (busy) return;
     commitMessages([]);
-    setConversationId(crypto.randomUUID());
+    setConversationId(createUuid());
     setPreview(null);
     setNotice('');
   }
@@ -635,7 +650,7 @@ export default function App() {
           restoredMessages[lastAssistant] = { ...restoredMessages[lastAssistant], artifacts: restored.artifacts };
         } else {
           restoredMessages.push({
-            id: crypto.randomUUID(),
+            id: createUuid(),
             role: 'assistant',
             content: '本会话的生成文件',
             status: 'complete',
