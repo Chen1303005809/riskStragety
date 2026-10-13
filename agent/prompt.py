@@ -10,13 +10,17 @@ from zoneinfo import ZoneInfo
 PROMPT_FILE = Path(__file__).with_name("system_prompt.md")
 TOOL_INSTRUCTIONS = """# 工具执行规则
 - 生成策略之前，先调用 list_interface_files，再用 read_interface_file 阅读接口源码，尤其是 external_head.py 与 external_baseid.py。接口示例只是契约参考，不是用户需求。
-- 必要参数缺失时按上文格式追问；这一轮不得调用 write_generated_file。
-- 需求完整时，先调用 write_generated_file 保存最终、完整的单文件 Python 策略，再按上文格式回复。写工具的 source 必须与回复中的 Python 代码块一致；文件名由继承 RHTemplate 的策略类名自动生成，不传 filename。
-- 只能使用提供的接口读取工具和生成文件写入工具。工具报错时根据错误调整调用；不要猜测读取结果或声称已保存失败的文件。"""
+- 完整策略源码只能通过工具调用在内部传递、检查并写入文件产物；面向用户的聊天回复不得包含完整策略源码，也不得通过分段内容拼出完整源码。工具调用中的 source 参数不受此限制。
+- 必要参数缺失时按上文格式追问；这一轮不得调用任何代码检测或写入工具。
+- 需求完整时，先对候选源码调用 check_python_syntax。只有通过后，才能对完全相同的 source 调用 run_functional_test；该工具会单独调用测试用例 Skill 构造用例并执行沙盒测试。
+- 语法或功能检测失败时，根据诊断修改源码，再重新运行语法检测和功能检测。不要自行替代 Skill 编造测试结果。
+- 如果历史中存在包含「【上轮失败诊断】」的助手消息，必须先读取其中的工具失败结果和最终错误，结合原始用户需求针对性修正；不要忽略诊断或原样重复失败调用。
+- 仅当同一份源码通过两项检测后，才调用 write_generated_file；写工具的 source 必须与检测通过的源码一致。文件名由继承 RHTemplate 的策略类名自动生成，不传 filename。
+- 只能使用提供的工具。工具报错时根据错误调整调用；不要猜测读取结果或声称已保存失败的文件。"""
 
 
 def build_system_prompt(now: datetime | None = None) -> str:
-    """Keep the old prompt unchanged while supplying its required date and tools."""
+    """Assemble the domain prompt with current-time and tool-use instructions."""
     source = PROMPT_FILE.read_text(encoding="utf-8").removesuffix("\n")
     current = now or datetime.now(ZoneInfo("Asia/Shanghai"))
     shanghai_time = current.astimezone(ZoneInfo("Asia/Shanghai"))
