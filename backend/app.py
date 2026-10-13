@@ -15,14 +15,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from agent.contracts import AgentEvent, ChatTurn, ModelGateway
+from agent.contracts import AgentEvent, ChatTurn, FunctionalTester, ModelGateway
+from agent.functional_tests import SkillFunctionalTester, SkillTestCaseBuilder
 from agent.runner import AgentRunner
+from agent.skills import FilesystemSkillLoader
 from backend.adapters.files import IndexedArtifactWriter, LocalArtifactStore, LocalInterfaceReader
 from backend.adapters.monitoring import (
     AccountNotFound,
     ConversationNotFound,
     MonitoringStore,
 )
+from backend.adapters.sandbox import DockerFunctionalSandbox
 from backend.adapters.ollama import OllamaModelGateway
 from backend.config import Settings
 from backend.schemas import ChatRequest, DownloadRequest
@@ -84,16 +87,26 @@ def create_app(
     model_gateway: ModelGateway | None = None,
     artifact_store: LocalArtifactStore | None = None,
     agent_runner: AgentRunner | None = None,
+    functional_tester: FunctionalTester | None = None,
 ) -> FastAPI:
     config = settings or Settings.from_env()
     model = model_gateway or OllamaModelGateway(config.ollama_base_url)
     artifacts = artifact_store or LocalArtifactStore(config.project_root / "artifacts")
     monitoring = MonitoringStore(config.data_dir / "monitoring.sqlite3", artifacts.directory)
-    runner = agent_runner or AgentRunner(
-        model,
-        LocalInterfaceReader(config.project_root / "interfaces" / "价格接口"),
-        IndexedArtifactWriter(artifacts, monitoring),
-    )
+    interface_directory = config.project_root / "interfaces" / "价格接口"
+    if agent_runner is None:
+        selected_tester = functional_tester or SkillFunctionalTester(
+            SkillTestCaseBuilder(model, FilesystemSkillLoader()),
+            DockerFunctionalSandbox(interface_directory, config.project_root),
+        )
+        runner = AgentRunner(
+            model,
+            LocalInterfaceReader(interface_directory),
+            IndexedArtifactWriter(artifacts, monitoring),
+            functional_tester=selected_tester,
+        )
+    else:
+        runner = agent_runner
     conversation_locks = _ConversationLockPool()
 
     @asynccontextmanager
@@ -197,10 +210,18 @@ def create_app(
                     raise
                 except Exception as exc:
                     if not finished:
+                        failure_context = getattr(exc, "failure_context", None)
+                        if not isinstance(failure_context, str) or not failure_context.strip():
+                            failure_context = f"【上轮失败诊断】\n本轮失败：{exc}"
+                        failed_content = "".join(partial_content)
+                        if failed_content.strip():
+                            failed_content = f"{failed_content}\n\n{failure_context}"
+                        else:
+                            failed_content = failure_context
                         await monitoring.finish_turn(
                             conversation_id,
                             assistant_message_id,
-                            "".join(partial_content),
+                            failed_content,
                             "failed",
                         )
                     yield _sse(

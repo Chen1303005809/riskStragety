@@ -10,7 +10,7 @@ import pytest
 
 from agent.contracts import Artifact, ChatTurn, ModelChunk, ToolCall
 from agent.prompt import PROMPT_FILE, build_system_prompt
-from agent.runner import AgentError, AgentRunner
+from agent.runner import AgentError, AgentRunner, check_python_syntax
 
 
 class MemoryInterfaces:
@@ -35,6 +35,22 @@ class MemoryArtifacts:
         return Artifact(f"{len(self.created):032x}", filename, account_id)
 
 
+class PassingFunctionalTester:
+    def __init__(self, passed: bool = True) -> None:
+        self.passed = passed
+        self.calls: list[dict[str, Any]] = []
+
+    async def run(self, source, *, requirements, model, options):
+        self.calls.append(
+            {"source": source, "requirements": list(requirements), "model": model, "options": options}
+        )
+        return {
+            "passed": self.passed,
+            "case_count": 1,
+            "cases": [{"name": "case", "passed": self.passed}],
+        }
+
+
 class ScriptedModel:
     def __init__(self, rounds: list[list[ModelChunk]]) -> None:
         self.rounds = rounds
@@ -48,7 +64,7 @@ class ScriptedModel:
         self, model, messages, tools, *, options, think
     ) -> AsyncIterator[ModelChunk]:
         assert model == "model-a"
-        assert len(tools) == 3
+        assert len(tools) == 5
         self.seen.append(messages.copy())
         self.settings_seen.append((options.copy(), think))
         for chunk in self.rounds[len(self.seen) - 1]:
@@ -68,23 +84,28 @@ def test_preserved_prompt_is_prefixed_without_editing_original() -> None:
     assert assembled.startswith(original + "\n\n# 当前时间")
     assert "list_interface_files" in assembled
     assert "read_interface_file" in assembled
+    assert "check_python_syntax" in assembled
+    assert "run_functional_test" in assembled
     assert "write_generated_file" in assembled
 
 
 def test_read_write_reply_flow() -> None:
-    source = "class My_TEST:\n    pass\n"
+    source = "class RiskStrategy(RHTemplate):\n    pass\n"
     model = ScriptedModel(
         [
             [ModelChunk(tool_calls=(ToolCall("list_interface_files", {}),))],
             [ModelChunk(tool_calls=(ToolCall("read_interface_file", {"filename": "external_head.py"}),))],
-            [ModelChunk(tool_calls=(ToolCall("write_generated_file", {"filename": "risk.py", "source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("write_generated_file", {"source": source}),))],
             [ModelChunk(content="已生成。", usage={"prompt_tokens": 42})],
         ]
     )
     interfaces = MemoryInterfaces()
     artifacts = MemoryArtifacts()
+    functional_tester = PassingFunctionalTester()
     events = collect(
-        AgentRunner(model, interfaces, artifacts),
+        AgentRunner(model, interfaces, artifacts, functional_tester=functional_tester),
         message="SHFE rb2710 超过 3800 时提醒",
         history=[],
         model="model-a",
@@ -93,18 +114,36 @@ def test_read_write_reply_flow() -> None:
         think=True,
     )
     assert interfaces.reads == ["external_head.py"]
-    assert artifacts.created == [("risk.py", source, "alice")]
+    assert artifacts.created == [("RiskStrategy.py", source, "alice")]
+    assert functional_tester.calls[0]["source"] == source
+    assert functional_tester.calls[0]["requirements"] == [
+        ChatTurn("user", "SHFE rb2710 超过 3800 时提醒")
+    ]
     assert [event.kind for event in events if event.kind in {"artifact", "delta", "done"}] == [
         "artifact", "delta", "done"
     ]
-    assert events[-1].data["artifacts"] == [{"artifact_id": "00000000000000000000000000000001", "filename": "risk.py"}]
+    assert events[-1].data["artifacts"] == [
+        {"artifact_id": "00000000000000000000000000000001", "filename": "RiskStrategy.py"}
+    ]
     assert model.seen[1][-1]["role"] == "tool"
     assert "external_head.py" in model.seen[1][-1]["content"]
-    assert model.seen[2][-1]["role"] == "tool"
-    assert "RHTemplate" in model.seen[2][-1]["content"]
+    assert model.seen[3][-1]["role"] == "tool"
+    assert '"passed": true' in model.seen[3][-1]["content"]
+    assert model.seen[4][-1]["role"] == "tool"
+    assert model.seen[3][-1]["tool_name"] == "check_python_syntax"
+    assert model.seen[4][-1]["tool_name"] == "run_functional_test"
+    assert model.seen[5][-1]["tool_name"] == "write_generated_file"
     assert model.settings_seen == [
         ({"temperature": 0.55, "top_p": 0.9, "num_ctx": 32_768}, True)
-    ] * 4
+    ] * 6
+
+
+def test_static_checker_uses_python_37_grammar() -> None:
+    assert check_python_syntax("value = 1\n")["passed"] is True
+    result = check_python_syntax("match value:\n    case _: pass\n")
+    assert result["passed"] is False
+    assert result["grammar"] == "Python 3.7"
+    assert result["line"] in {1, 2}
 
 
 def test_missing_parameters_ask_without_creating_file() -> None:
@@ -149,19 +188,25 @@ def test_clarification_cannot_write_even_if_model_also_calls_write_tool() -> Non
 
 
 def test_followup_receives_prior_turns_and_can_create_revision() -> None:
+    source = "class RiskStrategy(RHTemplate):\n    pass\n"
     model = ScriptedModel(
         [
-            [ModelChunk(tool_calls=(ToolCall("write_generated_file", {"filename": "revision.py", "source": "x = 3900\n"}),))],
+            [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("write_generated_file", {"source": source}),))],
             [ModelChunk(content="已将阈值改为 3900。")],
         ]
     )
     artifacts = MemoryArtifacts()
+    functional_tester = PassingFunctionalTester()
     history = [
         ChatTurn("user", "SHFE rb2710 超过 3800 时提醒"),
         ChatTurn("assistant", "原策略已生成。"),
     ]
     events = collect(
-        AgentRunner(model, MemoryInterfaces(), artifacts),
+        AgentRunner(
+            model, MemoryInterfaces(), artifacts, functional_tester=functional_tester
+        ),
         message="改为 3900",
         history=history,
         model="model-a",
@@ -169,8 +214,73 @@ def test_followup_receives_prior_turns_and_can_create_revision() -> None:
     )
     assert [item["role"] for item in model.seen[0]] == ["system", "user", "assistant", "user"]
     assert model.seen[0][-1]["content"] == "改为 3900"
-    assert artifacts.created == [("revision.py", "x = 3900\n", "alice")]
-    assert events[-1].data["artifacts"][0]["filename"] == "revision.py"
+    assert artifacts.created == [("RiskStrategy.py", source, "alice")]
+    assert events[-1].data["artifacts"][0]["filename"] == "RiskStrategy.py"
+    assert functional_tester.calls[0]["requirements"] == [
+        *history,
+        ChatTurn("user", "改为 3900"),
+    ]
+
+
+def test_modified_source_must_pass_functional_test_again_before_saving() -> None:
+    original = "class RiskStrategy(RHTemplate):\n    pass\n"
+    revised = "class RiskStrategy(RHTemplate):\n    def onTick(self, tick):\n        pass\n"
+    model = ScriptedModel(
+        [
+            [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": original}),))],
+            [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": original}),))],
+            [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": revised}),))],
+            [ModelChunk(tool_calls=(ToolCall("write_generated_file", {"source": revised}),))],
+            [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": revised}),))],
+            [ModelChunk(tool_calls=(ToolCall("write_generated_file", {"source": revised}),))],
+            [ModelChunk(content="已完成修改。")],
+        ]
+    )
+    artifacts = MemoryArtifacts()
+    tester = PassingFunctionalTester()
+
+    events = collect(
+        AgentRunner(model, MemoryInterfaces(), artifacts, functional_tester=tester),
+        message="生成并修正策略",
+        history=[],
+        model="model-a",
+        account_id="alice",
+    )
+
+    assert [call["source"] for call in tester.calls] == [original, revised]
+    assert artifacts.created == [("RiskStrategy.py", revised, "alice")]
+    assert '"error": "保存前必须先通过同一份源码的 run_functional_test"' in model.seen[4][-1]["content"]
+    assert events[-1].data["artifacts"][0]["filename"] == "RiskStrategy.py"
+
+
+def test_failed_functional_result_prevents_artifact_creation() -> None:
+    source = "class RiskStrategy(RHTemplate):\n    pass\n"
+    model = ScriptedModel(
+        [
+            [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("write_generated_file", {"source": source}),))],
+            [ModelChunk(content="当前版本尚未通过检测。")],
+        ]
+    )
+    artifacts = MemoryArtifacts()
+
+    with pytest.raises(AgentError, match="未保存"):
+        collect(
+            AgentRunner(
+                model,
+                MemoryInterfaces(),
+                artifacts,
+                functional_tester=PassingFunctionalTester(passed=False),
+            ),
+            message="生成策略",
+            history=[],
+            model="model-a",
+            account_id="alice",
+        )
+
+    assert artifacts.created == []
+    assert "run_functional_test" in model.seen[3][-1]["content"]
 
 
 def test_tool_round_limit() -> None:
@@ -182,16 +292,25 @@ def test_tool_round_limit() -> None:
 
 def test_concurrent_runs_keep_messages_and_artifacts_separate() -> None:
     class ConcurrentModel:
+        def __init__(self):
+            self.rounds: dict[str, int] = {}
+
         async def list_models(self):
             return ["model-a"]
 
         async def stream_chat(self, model, messages, tools, *, options, think):
             user_message = next(item["content"] for item in messages if item["role"] == "user")
             await asyncio.sleep(0.001)
-            if messages[-1]["role"] == "user":
-                yield ModelChunk(tool_calls=(ToolCall("write_generated_file", {
-                    "filename": f"{user_message}.py", "source": f"label = '{user_message}'\n"
-                }),))
+            round_index = self.rounds.get(user_message, 0)
+            self.rounds[user_message] = round_index + 1
+            source = f"class {user_message.upper()}Strategy(RHTemplate):\n    pass\n"
+            calls = [
+                ToolCall("check_python_syntax", {"source": source}),
+                ToolCall("run_functional_test", {"source": source}),
+                ToolCall("write_generated_file", {"source": source}),
+            ]
+            if round_index < len(calls):
+                yield ModelChunk(tool_calls=(calls[round_index],))
             else:
                 yield ModelChunk(content=f"已完成 {user_message}")
 
@@ -200,7 +319,12 @@ def test_concurrent_runs_keep_messages_and_artifacts_separate() -> None:
             await asyncio.sleep(0.001)
             return Artifact(f"{filename[0] * 32}", filename, account_id)
 
-    runner = AgentRunner(ConcurrentModel(), MemoryInterfaces(), ConcurrentArtifacts())
+    runner = AgentRunner(
+        ConcurrentModel(),
+        MemoryInterfaces(),
+        ConcurrentArtifacts(),
+        functional_tester=PassingFunctionalTester(),
+    )
 
     async def one(label):
         return [event async for event in runner.run(
@@ -211,8 +335,8 @@ def test_concurrent_runs_keep_messages_and_artifacts_separate() -> None:
     first, second = asyncio.run(_both(one))
     assert first[-1].data["content"] == "已完成 a"
     assert second[-1].data["content"] == "已完成 b"
-    assert first[-1].data["artifacts"] == [{"artifact_id": "a" * 32, "filename": "a.py"}]
-    assert second[-1].data["artifacts"] == [{"artifact_id": "b" * 32, "filename": "b.py"}]
+    assert first[-1].data["artifacts"] == [{"artifact_id": "A" * 32, "filename": "AStrategy.py"}]
+    assert second[-1].data["artifacts"] == [{"artifact_id": "B" * 32, "filename": "BStrategy.py"}]
 
 
 async def _both(one):

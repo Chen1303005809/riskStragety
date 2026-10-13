@@ -246,7 +246,10 @@ class MonitoringStore:
                 (row["role"], row["content"])
                 for row in connection.execute(
                     """SELECT role, content FROM messages
-                       WHERE conversation_id = ? AND status = 'complete'
+                       WHERE conversation_id = ? AND (
+                           status = 'complete'
+                           OR (role = 'assistant' AND status = 'failed' AND length(trim(content)) > 0)
+                       )
                        ORDER BY sequence ASC""",
                     (conversation_id,),
                 )

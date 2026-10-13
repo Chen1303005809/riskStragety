@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 
 import pytest
@@ -25,29 +24,23 @@ def test_interface_reader_lists_and_reads_only_direct_python_files(tmp_path: Pat
             asyncio.run(reader.read_file(name))
 
 
-def test_artifacts_are_new_files_and_account_scoped(tmp_path: Path) -> None:
+def test_artifact_store_writes_unique_immutable_sources(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path / "artifacts")
     first = asyncio.run(store.create("risk.py", "x = 1\n", "alice"))
     second = asyncio.run(store.create("risk.py", "x = 2\n", "alice"))
     assert first.artifact_id != second.artifact_id
-    assert asyncio.run(store.read(first.artifact_id, "alice")).content == b"x = 1\n"
-    assert asyncio.run(store.read(second.artifact_id, "alice")).content == b"x = 2\n"
+    assert asyncio.run(store.read_source(first.artifact_id)) == b"x = 1\n"
+    assert asyncio.run(store.read_source(second.artifact_id)) == b"x = 2\n"
     with pytest.raises(FileNotFoundError):
-        asyncio.run(store.read(first.artifact_id, "bob"))
-    with pytest.raises(FileNotFoundError):
-        asyncio.run(store.read("../risk.py", "alice"))
-    metadata = json.loads((tmp_path / "artifacts" / f"{first.artifact_id}.json").read_text())
-    assert metadata == {"filename": "risk.py", "account_id": "alice"}
+        asyncio.run(store.read_source("../risk.py"))
 
 
-def test_artifact_store_rejects_names_invalid_code_and_corrupt_metadata(tmp_path: Path) -> None:
+def test_artifact_store_rejects_names_and_invalid_python_code(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path / "artifacts")
     for filename in ("../risk.py", "/tmp/risk.py", "risk.txt", ".hidden.py", "bad\nname.py"):
         with pytest.raises(ValueError):
             asyncio.run(store.create(filename, "x = 1\n", "alice"))
     with pytest.raises(ValueError, match="3.7"):
         asyncio.run(store.create("risk.py", "match 1:\n    case 1: pass\n", "alice"))
-    artifact = asyncio.run(store.create("risk.py", "x = 1\n", "alice"))
-    (tmp_path / "artifacts" / f"{artifact.artifact_id}.json").write_text("[]")
     with pytest.raises(FileNotFoundError):
-        asyncio.run(store.read(artifact.artifact_id, "alice"))
+        asyncio.run(store.read_source("0" * 32))

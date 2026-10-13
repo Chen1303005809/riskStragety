@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 import json
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from agent.contracts import (
@@ -13,6 +15,7 @@ from agent.contracts import (
     Artifact,
     ArtifactWriter,
     ChatTurn,
+    FunctionalTester,
     InterfaceReader,
     ModelGateway,
     ToolCall,
@@ -20,7 +23,7 @@ from agent.contracts import (
 from agent.prompt import build_system_prompt
 
 
-MAX_TOOL_ROUNDS = 8
+MAX_TOOL_ROUNDS = 12
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -45,8 +48,32 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "check_python_syntax",
+            "description": "静态检查候选策略是否符合 Python 3.7 语法；修正源码后必须重新检查。",
+            "parameters": {
+                "type": "object",
+                "properties": {"source": {"type": "string", "description": "完整 Python 源码"}},
+                "required": ["source"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_functional_test",
+            "description": "按用户规则构造测试用例并在隔离沙盒中运行候选策略；必须先通过 check_python_syntax。",
+            "parameters": {
+                "type": "object",
+                "properties": {"source": {"type": "string", "description": "通过语法检查的完整 Python 源码"}},
+                "required": ["source"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "write_generated_file",
-            "description": "把完成的 Python 策略保存为新的可下载文件；根据 source 中继承 RHTemplate 的策略类名自动命名；不得用于参数追问轮。",
+            "description": "保存已通过语法和功能检测的完整策略；根据继承 RHTemplate 的策略类名自动命名；不得用于参数追问轮。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -62,6 +89,57 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 class AgentError(RuntimeError):
     """A request cannot finish after a bounded number of tool rounds."""
 
+    def __init__(self, message: str, *, failure_context: str | None = None) -> None:
+        super().__init__(message)
+        self.failure_context = failure_context
+
+
+def _failure_context(message: str, tool_failures: Sequence[str]) -> str:
+    """Build a concise assistant turn that lets a later request correct the failure."""
+    lines = ["【上轮失败诊断】", f"本轮失败：{message}"]
+    if tool_failures:
+        lines.append("工具失败结果：")
+        lines.extend(f"- {failure}" for failure in tool_failures)
+    return "\n".join(lines)
+
+
+@dataclass
+class _ValidationState:
+    syntax_passed: set[str] = field(default_factory=set)
+    functional_passed: set[str] = field(default_factory=set)
+
+
+def _source_digest(source: str) -> str:
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _coalesce_adjacent_turns(turns: Sequence[ChatTurn]) -> list[ChatTurn]:
+    """Keep the chat role sequence valid when failed turns leave orphaned messages."""
+    merged: list[ChatTurn] = []
+    for turn in turns:
+        if merged and merged[-1].role == turn.role:
+            previous = merged[-1]
+            merged[-1] = ChatTurn(turn.role, f"{previous.content}\n\n{turn.content}")
+        else:
+            merged.append(turn)
+    return merged
+
+
+def check_python_syntax(source: str) -> dict[str, Any]:
+    """Parse as Python 3.7 syntax and compile without executing the source."""
+    try:
+        ast.parse(source, filename="<generated strategy>", feature_version=(3, 7))
+        compile(source, "<generated strategy>", "exec")
+    except SyntaxError as exc:
+        return {
+            "passed": False,
+            "grammar": "Python 3.7",
+            "error": exc.msg,
+            "line": exc.lineno,
+            "column": exc.offset,
+        }
+    return {"passed": True, "grammar": "Python 3.7", "error": None}
+
 
 class AgentRunner:
     def __init__(
@@ -70,11 +148,13 @@ class AgentRunner:
         interfaces: InterfaceReader,
         artifacts: ArtifactWriter,
         max_tool_rounds: int = MAX_TOOL_ROUNDS,
+        functional_tester: FunctionalTester | None = None,
     ) -> None:
         self._model = model
         self._interfaces = interfaces
         self._artifacts = artifacts
         self._max_tool_rounds = max_tool_rounds
+        self._functional_tester = functional_tester
 
     async def run(
         self,
@@ -92,13 +172,18 @@ class AgentRunner:
             "top_p": 0.8,
             "num_ctx": 16_384,
         }
+        conversation_turns = _coalesce_adjacent_turns(
+            [*history, ChatTurn("user", message)]
+        )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": build_system_prompt()},
-            *({"role": turn.role, "content": turn.content} for turn in history),
-            {"role": "user", "content": message},
+            *({"role": turn.role, "content": turn.content} for turn in conversation_turns),
         ]
         visible_content: list[str] = []
         created: list[Artifact] = []
+        tool_failures: list[str] = []
+        validation = _ValidationState()
+        requirements = [*history, ChatTurn("user", message)]
         yield AgentEvent("status", {"phase": "started", "model": model})
 
         for round_index in range(self._max_tool_rounds + 1):
@@ -122,7 +207,11 @@ class AgentRunner:
 
             if "".join(round_content).lstrip().startswith("【参数补充请求】"):
                 if created:
-                    raise AgentError("已保存文件后不能再发出参数补充请求")
+                    message = "已保存文件后不能再发出参数补充请求"
+                    raise AgentError(
+                        message,
+                        failure_context=_failure_context(message, tool_failures),
+                    )
                 yield AgentEvent(
                     "done",
                     {"content": "".join(visible_content), "model": model, "artifacts": [], "usage": usage},
@@ -133,10 +222,18 @@ class AgentRunner:
                 content = "".join(visible_content)
                 if not content.strip():
                     if not created:
-                        raise AgentError("模型没有返回内容")
+                        message = "模型没有返回内容"
+                        raise AgentError(
+                            message,
+                            failure_context=_failure_context(message, tool_failures),
+                        )
                     content = "策略文件已生成，请通过产物卡片预览或下载。"
                 if not created and "【参数补充请求】" not in content:
-                    raise AgentError("模型未保存策略文件，也未发出参数补充请求")
+                    message = "模型未保存策略文件，也未发出参数补充请求"
+                    raise AgentError(
+                        message,
+                        failure_context=_failure_context(message, tool_failures),
+                    )
                 yield AgentEvent(
                     "done",
                     {
@@ -152,7 +249,11 @@ class AgentRunner:
                 return
 
             if round_index >= self._max_tool_rounds:
-                raise AgentError(f"工具调用超过 {self._max_tool_rounds} 轮上限")
+                message = f"工具调用超过 {self._max_tool_rounds} 轮上限"
+                raise AgentError(
+                    message,
+                    failure_context=_failure_context(message, tool_failures),
+                )
 
             messages.append(
                 {
@@ -167,9 +268,21 @@ class AgentRunner:
             for call in calls:
                 yield AgentEvent("status", {"phase": "tool_started", "tool": call.name})
                 try:
-                    result, artifact = await self._call_tool(call, account_id, conversation_id)
+                    result, artifact = await self._call_tool(
+                        call,
+                        account_id,
+                        conversation_id,
+                        validation=validation,
+                        requirements=requirements,
+                        model=model,
+                        options=model_options,
+                    )
                 except (ValueError, OSError) as exc:
                     result, artifact = {"error": str(exc)}, None
+                if result.get("error") or result.get("passed") is False:
+                    tool_failures.append(
+                        f"{call.name}: {json.dumps(result, ensure_ascii=False)}"
+                    )
                 if artifact:
                     created.append(artifact)
                     yield AgentEvent(
@@ -185,10 +298,22 @@ class AgentRunner:
                 )
                 yield AgentEvent("status", {"phase": "tool_finished", "tool": call.name})
 
-        raise AgentError("Agent 未能完成请求")
+        message = "Agent 未能完成请求"
+        raise AgentError(
+            message,
+            failure_context=_failure_context(message, tool_failures),
+        )
 
     async def _call_tool(
-        self, call: ToolCall, account_id: str, conversation_id: str | None
+        self,
+        call: ToolCall,
+        account_id: str,
+        conversation_id: str | None,
+        *,
+        validation: _ValidationState,
+        requirements: Sequence[ChatTurn],
+        model: str,
+        options: dict[str, int | float],
     ) -> tuple[dict[str, Any], Artifact | None]:
         args = call.arguments
         if call.name == "list_interface_files":
@@ -198,36 +323,74 @@ class AgentRunner:
             if not isinstance(filename, str):
                 raise ValueError("filename 必须是文件名字符串")
             return {"filename": filename, "source": await self._interfaces.read_file(filename)}, None
-        if call.name == "write_generated_file":
-            source, filename_hint = args.get("source"), args.get("filename")
+        if call.name == "check_python_syntax":
+            source = args.get("source")
             if not isinstance(source, str):
                 raise ValueError("source 必须是字符串")
+            digest = _source_digest(source)
+            result = check_python_syntax(source)
+            if result["passed"]:
+                validation.syntax_passed.add(digest)
+            else:
+                validation.syntax_passed.discard(digest)
+                validation.functional_passed.discard(digest)
+            return result, None
+        if call.name == "run_functional_test":
+            source = args.get("source")
+            if not isinstance(source, str):
+                raise ValueError("source 必须是字符串")
+            digest = _source_digest(source)
+            if digest not in validation.syntax_passed:
+                raise ValueError("请先对完全相同的源码调用 check_python_syntax 并通过")
+            if self._functional_tester is None:
+                raise ValueError("功能检测服务未配置，无法保存策略")
             try:
-                source_tree = ast.parse(source)
+                result = await self._functional_tester.run(
+                    source,
+                    requirements=requirements,
+                    model=model,
+                    options=options,
+                )
+            except (ValueError, OSError):
+                validation.functional_passed.discard(digest)
+                raise
+            except Exception as exc:
+                validation.functional_passed.discard(digest)
+                raise ValueError(f"功能检测失败：{exc}") from exc
+            if not isinstance(result, dict):
+                validation.functional_passed.discard(digest)
+                raise ValueError("功能检测服务返回了无效结果")
+            if result.get("passed") is True:
+                validation.functional_passed.add(digest)
+            else:
+                validation.functional_passed.discard(digest)
+            return result, None
+        if call.name == "write_generated_file":
+            source = args.get("source")
+            if not isinstance(source, str):
+                raise ValueError("source 必须是字符串")
+            digest = _source_digest(source)
+            if digest not in validation.syntax_passed:
+                raise ValueError("保存前必须先通过同一份源码的 check_python_syntax")
+            if digest not in validation.functional_passed:
+                raise ValueError("保存前必须先通过同一份源码的 run_functional_test")
+            try:
+                source_tree = ast.parse(source, feature_version=(3, 7))
             except SyntaxError as exc:
-                if not isinstance(filename_hint, str):
-                    raise ValueError(f"策略源码语法无效，无法确定策略类名：{exc.msg}") from exc
-                source_tree = None
-            strategy_classes = (
-                [
-                    node
-                    for node in source_tree.body
-                    if isinstance(node, ast.ClassDef)
-                    and any(
-                        isinstance(base, ast.Name) and base.id == "RHTemplate"
-                        for base in node.bases
-                    )
-                ]
-                if source_tree is not None
-                else []
-            )
+                raise ValueError(f"策略源码语法无效，无法确定策略类名：{exc.msg}") from exc
+            strategy_classes = [
+                node
+                for node in source_tree.body
+                if isinstance(node, ast.ClassDef)
+                and any(
+                    isinstance(base, ast.Name) and base.id == "RHTemplate"
+                    for base in node.bases
+                )
+            ]
             if len(strategy_classes) > 1:
                 raise ValueError("策略源码只能包含一个直接继承 RHTemplate 的顶层策略类")
             if strategy_classes:
                 filename = f"{strategy_classes[0].name}.py"
-            elif isinstance(filename_hint, str):
-                # 兼容不含 Agent 策略类的旧式工具调用；策略生成流程由上方类名自动命名。
-                filename = filename_hint
             else:
                 raise ValueError("策略源码必须包含一个直接继承 RHTemplate 的顶层策略类")
             create = self._artifacts.create

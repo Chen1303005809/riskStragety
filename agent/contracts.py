@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -63,3 +63,14 @@ class ArtifactWriter(Protocol):
     async def create(
         self, filename: str, source: str, account_id: str, conversation_id: str | None = None
     ) -> Artifact: ...
+
+
+class FunctionalTester(Protocol):
+    async def run(
+        self,
+        source: str,
+        *,
+        requirements: Sequence[ChatTurn],
+        model: str,
+        options: dict[str, int | float],
+    ) -> dict[str, Any]: ...

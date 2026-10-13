@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from pydantic import BaseModel, Field, StrictBool, StrictStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator
 
 
 class ModelOptions(BaseModel):
@@ -21,6 +21,8 @@ class ModelOptions(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     account_id: StrictStr = Field(min_length=1, max_length=128)
     conversation_id: UUID
     message: str = Field(min_length=1, max_length=20_000)
@@ -38,6 +40,8 @@ class ChatRequest(BaseModel):
 
 
 class DownloadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     account_id: StrictStr = Field(min_length=1, max_length=128)
     artifact_id: str = Field(pattern=r"^[0-9a-f]{32}$")
 

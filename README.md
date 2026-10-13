@@ -19,7 +19,11 @@
 
 ## 本地启动
 
-需要 Conda、Node.js 20+，以及一个支持工具调用的 Ollama 模型。先安装并启动 Ollama、拉取所选模型；模型名称以 `GET /api/models` 实际返回为准。
+需要 Conda、Node.js 20+、Docker，以及一个支持工具调用的 Ollama 模型。先安装并启动 Ollama、拉取所选模型；模型名称以 `GET /api/models` 实际返回为准。功能检测使用预先下载的 Python 3.12 容器镜像：
+
+```bash
+docker pull python:3.12-slim
+```
 
 ```bash
 conda create -n risk-agent python=3.12 -y
@@ -68,7 +72,9 @@ curl -N http://127.0.0.1:8765/api/agent/chat/stream \
 
 `GET /api/models` 返回已安装的 `models` 列表和服务端配置的 `default_model`。网页优先选择已安装的默认模型。
 
-必要参数不足时，Agent 按旧提示词追问；用户补充后服务端从 SQLite 恢复此前历史。生成文件源码保存到 `artifacts/`，归属及会话索引写入 SQLite；Agent 不覆盖接口源码或已有文件。Agent 对生成源码做 Python 3.7 语法检查，以符合迁入接口的策略规范；它不会执行生成代码。
+必要参数不足时，Agent 按提示词追问；用户补充后服务端从 SQLite 恢复此前历史。生成文件源码保存到 `artifacts/`，归属及会话索引写入 SQLite；Agent 不覆盖接口源码或已有文件。生成源码必须先通过 Python 3.7 语法检查，再由独立测试用例 Skill 根据对话需求构造行情用例，并在无网络、只读挂载且有限制的 Docker 沙盒中执行。沙盒模拟消息引擎及未实现的 `RHclient`；检测结果不代表真实行情引擎验证。
+
+Skill 文件位于 `agent/skills/<skill_id>/SKILL.md`。`SkillLoader` 是可复用的异步接口，`load(skill_id)` 返回包含 `skill_id` 与 `instructions` 的 `Skill`；默认 `FilesystemSkillLoader` 会校验 ID、路径、UTF-8 编码和大小。添加 Skill 时只需新增符合 ID 规则的目录及 `SKILL.md`。加载失败会让功能检测失败，不会回退到其他提示词；测试或其他存储来源可以通过实现 `SkillLoader` 注入。
 
 监控读取接口沿用相同的 Bearer Key：
 
