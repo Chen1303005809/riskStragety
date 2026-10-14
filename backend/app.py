@@ -10,10 +10,12 @@ from contextlib import asynccontextmanager
 from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from agent.contracts import AgentEvent, ChatTurn, FunctionalTester, ModelGateway
 from agent.functional_tests import SkillFunctionalTester, SkillTestCaseBuilder
@@ -33,6 +35,56 @@ from backend.security import Principal, require_principal
 
 
 ARTIFACT_STREAM_CHUNK_SIZE = 64 * 1024
+
+ERROR_MESSAGES = {
+    "ok": "",
+    "file_not_generated": "本轮已完成，但未生成策略文件。",
+    "auth_invalid": "API Key 无效",
+    "request_invalid": "请求参数无效",
+    "conversation_not_found": "会话不存在",
+    "account_not_found": "账号不存在",
+    "artifact_not_found": "产物不存在",
+    "model_service_unavailable": "模型服务暂不可用，请稍后重试",
+    "agent_incomplete": "本轮生成未正常结束，请重试",
+    "agent_failed": "本轮处理失败，请稍后重试",
+    "resource_not_found": "请求的资源不存在",
+    "method_not_allowed": "请求方法不受支持",
+    "internal_error": "服务内部错误，请稍后重试",
+}
+
+
+class MappedHTTPException(HTTPException):
+    """An HTTP failure with a stable, client-safe error code."""
+
+    def __init__(self, status_code: int, err_code: str) -> None:
+        if err_code not in ERROR_MESSAGES:
+            raise ValueError(f"unknown client error code: {err_code}")
+        super().__init__(status_code=status_code, detail=ERROR_MESSAGES[err_code])
+        self.err_code = err_code
+
+
+def _error_response(
+    status_code: int,
+    err_code: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    message = ERROR_MESSAGES[err_code]
+    return JSONResponse(
+        status_code=status_code,
+        headers=headers,
+        content={"detail": message, "ErrCode": err_code, "ErrMsg": message},
+    )
+
+
+def _framework_http_error_code(status_code: int) -> str:
+    return {
+        401: "auth_invalid",
+        404: "resource_not_found",
+        405: "method_not_allowed",
+        422: "request_invalid",
+        502: "model_service_unavailable",
+    }.get(status_code, "internal_error" if status_code >= 500 else "request_invalid")
 
 
 def _artifact_chunks(content: bytes) -> Iterator[bytes]:
@@ -119,6 +171,33 @@ def create_app(
     app = FastAPI(title="风控策略 Agent", lifespan=lifespan)
     app.state.settings = config
     app.state.monitoring = monitoring
+
+    @app.exception_handler(MappedHTTPException)
+    async def mapped_http_exception_handler(
+        _: Request, exc: MappedHTTPException
+    ) -> JSONResponse:
+        return _error_response(exc.status_code, exc.err_code, headers=exc.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_exception_handler(
+        _: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        return _error_response(422, "request_invalid")
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(
+        _: Request, exc: StarletteHTTPException
+    ) -> JSONResponse:
+        return _error_response(
+            exc.status_code,
+            _framework_http_error_code(exc.status_code),
+            headers=exc.headers,
+        )
+
+    @app.exception_handler(Exception)
+    async def unexpected_exception_handler(_: Request, __: Exception) -> JSONResponse:
+        return _error_response(500, "internal_error")
+
     if config.cors_origins:
         app.add_middleware(
             CORSMiddleware,
@@ -136,7 +215,7 @@ def create_app(
                 "default_model": config.ollama_model,
             }
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Ollama 模型列表不可用：{exc}") from exc
+            raise MappedHTTPException(502, "model_service_unavailable") from exc
 
     @app.post("/api/agent/chat/stream")
     async def chat(
@@ -149,17 +228,31 @@ def create_app(
                 payload.account_id, conversation_id, payload.message
             )
         except ConversationNotFound as exc:
-            raise HTTPException(status_code=404, detail="会话不存在") from exc
+            raise MappedHTTPException(404, "conversation_not_found") from exc
 
         async def stream():
-            async with conversation_locks.hold(conversation_id):
-                history_rows, _, assistant_message_id = await monitoring.begin_turn(
-                    payload.account_id, conversation_id, payload.message
-                )
-                history = [ChatTurn(role, content) for role, content in history_rows]
-                partial_content: list[str] = []
-                finished = False
+            partial_content: list[str] = []
+            assistant_message_id: int | None = None
+            turn_finalized = False
+
+            async def finalize_failed_turn(content: str) -> None:
+                nonlocal turn_finalized
+                if assistant_message_id is None or turn_finalized:
+                    return
                 try:
+                    await monitoring.finish_turn(
+                        conversation_id, assistant_message_id, content, "failed"
+                    )
+                except Exception:
+                    pass
+                turn_finalized = True
+
+            try:
+                async with conversation_locks.hold(conversation_id):
+                    history_rows, _, assistant_message_id = await monitoring.begin_turn(
+                        payload.account_id, conversation_id, payload.message
+                    )
+                    history = [ChatTurn(role, content) for role, content in history_rows]
                     async for event in runner.run(
                         message=payload.message,
                         history=history,
@@ -177,57 +270,86 @@ def create_app(
                             content = event.data.get("content")
                             if isinstance(content, str):
                                 partial_content = [content]
+                            artifacts_data = event.data.get("artifacts")
+                            has_artifacts = isinstance(artifacts_data, list) and bool(artifacts_data)
+                            err_code = "ok" if has_artifacts else "file_not_generated"
+                            err_msg = ERROR_MESSAGES[err_code]
+                            done_event = AgentEvent(
+                                "done",
+                                {
+                                    **event.data,
+                                    "ErrCode": err_code,
+                                    "ErrMsg": err_msg,
+                                },
+                            )
                             await monitoring.finish_turn(
                                 conversation_id,
                                 assistant_message_id,
                                 "".join(partial_content),
                                 "complete",
                             )
-                            finished = True
+                            turn_finalized = True
+                            yield _sse(done_event, conversation_id=conversation_id)
+                            return
+                        if event.kind == "error":
+                            await finalize_failed_turn("".join(partial_content))
+                            yield _sse(
+                                AgentEvent(
+                                    "error",
+                                    {
+                                        "ErrCode": "agent_failed",
+                                        "ErrMsg": ERROR_MESSAGES["agent_failed"],
+                                    },
+                                ),
+                                conversation_id=conversation_id,
+                            )
+                            return
                         yield _sse(event, conversation_id=conversation_id)
-                    if not finished:
-                        await monitoring.finish_turn(
-                            conversation_id,
-                            assistant_message_id,
-                            "".join(partial_content),
-                            "failed",
-                        )
-                        yield _sse(
-                            AgentEvent(
-                                "error",
-                                {"code": "agent_incomplete", "message": "Agent 响应提前结束"},
-                            ),
-                            conversation_id=conversation_id,
-                        )
-                except asyncio.CancelledError:
-                    if not finished:
+
+                    await finalize_failed_turn("".join(partial_content))
+                    yield _sse(
+                        AgentEvent(
+                            "error",
+                            {
+                                "ErrCode": "agent_incomplete",
+                                "ErrMsg": ERROR_MESSAGES["agent_incomplete"],
+                            },
+                        ),
+                        conversation_id=conversation_id,
+                    )
+            except asyncio.CancelledError:
+                if assistant_message_id is not None and not turn_finalized:
+                    try:
                         await monitoring.finish_turn(
                             conversation_id,
                             assistant_message_id,
                             "".join(partial_content),
                             "interrupted",
                         )
-                    raise
-                except Exception as exc:
-                    if not finished:
-                        failure_context = getattr(exc, "failure_context", None)
-                        if not isinstance(failure_context, str) or not failure_context.strip():
-                            failure_context = f"【上轮失败诊断】\n本轮失败：{exc}"
-                        failed_content = "".join(partial_content)
-                        if failed_content.strip():
-                            failed_content = f"{failed_content}\n\n{failure_context}"
-                        else:
-                            failed_content = failure_context
-                        await monitoring.finish_turn(
-                            conversation_id,
-                            assistant_message_id,
-                            failed_content,
-                            "failed",
-                        )
-                    yield _sse(
-                        AgentEvent("error", {"code": "agent_failed", "message": str(exc)}),
-                        conversation_id=conversation_id,
-                    )
+                    finally:
+                        turn_finalized = True
+                raise
+            except Exception as exc:
+                if assistant_message_id is not None and not turn_finalized:
+                    failure_context = getattr(exc, "failure_context", None)
+                    if not isinstance(failure_context, str) or not failure_context.strip():
+                        failure_context = f"【上轮失败诊断】\n本轮失败：{exc}"
+                    failed_content = "".join(partial_content)
+                    if failed_content.strip():
+                        failed_content = f"{failed_content}\n\n{failure_context}"
+                    else:
+                        failed_content = failure_context
+                    await finalize_failed_turn(failed_content)
+                yield _sse(
+                    AgentEvent(
+                        "error",
+                        {
+                            "ErrCode": "agent_failed",
+                            "ErrMsg": ERROR_MESSAGES["agent_failed"],
+                        },
+                    ),
+                    conversation_id=conversation_id,
+                )
 
         return StreamingResponse(
             stream(),
@@ -243,11 +365,11 @@ def create_app(
             payload.artifact_id, payload.account_id
         )
         if artifact_record is None:
-            raise HTTPException(status_code=404, detail="产物不存在")
+            raise MappedHTTPException(404, "artifact_not_found")
         try:
             content = await artifacts.read_source(payload.artifact_id)
         except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail="产物不存在") from exc
+            raise MappedHTTPException(404, "artifact_not_found") from exc
 
         return StreamingResponse(
             _artifact_chunks(content),
@@ -280,7 +402,7 @@ def create_app(
                 account_id.strip(), offset, limit, unassigned_offset, unassigned_limit
             )
         except AccountNotFound as exc:
-            raise HTTPException(status_code=404, detail="账号不存在") from exc
+            raise MappedHTTPException(404, "account_not_found") from exc
 
     @app.get("/api/monitor/accounts/{account_id:path}/conversations/{conversation_id}")
     async def monitor_conversation_detail(
@@ -295,7 +417,7 @@ def create_app(
         try:
             normalized_conversation_id = str(UUID(conversation_id))
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail="conversation_id 必须是 UUID") from exc
+            raise MappedHTTPException(422, "request_invalid") from exc
         try:
             return await monitoring.conversation_detail(
                 account_id.strip(),
@@ -306,7 +428,7 @@ def create_app(
                 artifact_limit,
             )
         except ConversationNotFound as exc:
-            raise HTTPException(status_code=404, detail="会话不存在") from exc
+            raise MappedHTTPException(404, "conversation_not_found") from exc
 
     dist = config.project_root / "frontend" / "dist"
     if (dist / "assets").is_dir():

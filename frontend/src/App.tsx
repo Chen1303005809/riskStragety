@@ -564,6 +564,9 @@ export default function App() {
             status: 'complete',
             artifacts: done.artifacts,
           });
+          if (done.ErrCode === 'file_not_generated') {
+            setNotice(done.ErrMsg || '本轮已完成，但未生成策略文件。');
+          }
         },
       }, controller.signal);
     } catch (error) {

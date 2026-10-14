@@ -119,6 +119,8 @@ def test_chat_sse_and_artifact_download(tmp_path: Path) -> None:
     assert events[-1][1]["artifacts"] == [{
         "artifact_id": artifact["artifact_id"], "filename": artifact["filename"]
     }]
+    assert events[-1][1]["ErrCode"] == "ok"
+    assert events[-1][1]["ErrMsg"] == ""
     assert len(artifact["artifact_id"]) == 32
     assert model.settings_seen == [
         ({"temperature": 0.3, "top_p": 0.8, "num_ctx": 16_384}, False),
@@ -235,9 +237,17 @@ def test_model_unavailable_and_stream_failure_are_reported(tmp_path: Path) -> No
     client = client_for(tmp_path, BrokenModel())
     models = client.get("/api/models", headers=AUTH)
     assert models.status_code == 502
+    assert models.json() == {
+        "detail": "模型服务暂不可用，请稍后重试",
+        "ErrCode": "model_service_unavailable",
+        "ErrMsg": "模型服务暂不可用，请稍后重试",
+    }
     response = client.post("/api/agent/chat/stream", headers=AUTH, json={**CHAT_CONTEXT, "message": "生成"})
     assert [kind for kind, _ in events_from(response.text)] == ["status", "delta", "error"]
-    assert "Ollama offline" in response.text
+    error = events_from(response.text)[-1][1]
+    assert error["ErrCode"] == "agent_failed"
+    assert error["ErrMsg"] == "本轮处理失败，请稍后重试"
+    assert "Ollama offline" not in response.text
 
 
 def test_request_schema_rejects_invalid_history(tmp_path: Path) -> None:
@@ -270,6 +280,9 @@ def test_chat_accepts_custom_model_options_and_think(tmp_path: Path) -> None:
         "think": True,
     })
     assert response.status_code == 200
+    done = events_from(response.text)[-1][1]
+    assert done["ErrCode"] == "file_not_generated"
+    assert done["ErrMsg"] == "本轮已完成，但未生成策略文件。"
     assert model.settings_seen == [
         ({"temperature": 0.55, "top_p": 0.9, "num_ctx": 32_768}, True)
     ]

@@ -38,6 +38,8 @@ export interface DoneEvent {
   model: string;
   artifacts: Artifact[];
   usage: Record<string, number>;
+  ErrCode: string;
+  ErrMsg: string;
 }
 
 export interface Page<T> {

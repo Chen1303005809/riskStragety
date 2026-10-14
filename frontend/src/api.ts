@@ -17,6 +17,13 @@ interface StreamCallbacks {
   onDone: (done: DoneEvent) => void;
 }
 
+export class ApiError extends Error {
+  constructor(message: string, readonly errCode?: string) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 function authHeaders(apiKey: string): HeadersInit {
   return {
     Authorization: 'Bearer ' + apiKey,
@@ -25,14 +32,21 @@ function authHeaders(apiKey: string): HeadersInit {
 }
 
 async function responseError(response: Response): Promise<Error> {
-  let detail = '';
+  let message = '';
+  let errCode: string | undefined;
   try {
-    const body = await response.json() as { detail?: string };
-    detail = body.detail || '';
+    const body = await response.json() as {
+      detail?: unknown;
+      ErrCode?: unknown;
+      ErrMsg?: unknown;
+    };
+    message = typeof body.ErrMsg === 'string' ? body.ErrMsg : '';
+    if (!message && typeof body.detail === 'string') message = body.detail;
+    errCode = typeof body.ErrCode === 'string' ? body.ErrCode : undefined;
   } catch {
-    detail = response.statusText;
+    message = response.statusText;
   }
-  return new Error(detail || 'HTTP ' + response.status);
+  return new ApiError(message || 'HTTP ' + response.status, errCode);
 }
 
 export async function fetchModels(apiKey: string): Promise<{ models: string[]; defaultModel: string }> {
@@ -158,7 +172,10 @@ function handleFrame(frame: string, callbacks: StreamCallbacks): boolean {
     callbacks.onDone(payload as unknown as DoneEvent);
     return true;
   } else if (event === 'error') {
-    throw new Error(String(payload.message || 'Agent 执行失败'));
+    throw new ApiError(
+      typeof payload.ErrMsg === 'string' && payload.ErrMsg ? payload.ErrMsg : 'Agent 执行失败',
+      typeof payload.ErrCode === 'string' ? payload.ErrCode : undefined,
+    );
   }
   return false;
 }

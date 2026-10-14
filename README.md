@@ -67,8 +67,26 @@ curl -N http://127.0.0.1:8765/api/agent/chat/stream \
 | `status` | `phase`（开始或工具执行状态）、可选 `tool`。 |
 | `delta` | `text`，回复的流式片段。 |
 | `artifact` | `artifact_id`、`filename`，表示文件已保存。 |
-| `done` | 完整 `content`、`model`、本轮 `artifacts`、`usage`。 |
-| `error` | `code`、`message`；上游不可用或工具循环失败等。 |
+| `done` | 完整 `content`、`model`、本轮 `artifacts`、`usage`、`ErrCode`、`ErrMsg`。有产物时 `ErrCode` 为 `ok`；无产物时仍正常结束，但返回 `file_not_generated`。 |
+| `error` | `ErrCode`、`ErrMsg`；模型、Agent 或工具运行失败，以及 Agent 流提前结束。 |
+
+只有最终的 `done` 或 `error` 事件带 `ErrCode`、`ErrMsg`。`done` 的两个字段与 `content` 同级；HTTP 错误响应也在 JSON 顶层返回这两个字段，并保留 `detail`，其内容与 `ErrMsg` 一致。错误消息为固定客户端文案，不包含上游异常原文。
+
+| ErrCode | 场景 | HTTP 状态 / SSE 事件 | ErrMsg |
+| --- | --- | --- | --- |
+| `ok` | SSE 正常完成且至少生成一个文件 | `done` | 空字符串 |
+| `file_not_generated` | SSE 正常完成，但 `artifacts` 为空 | `done` | 本轮已完成，但未生成策略文件。 |
+| `auth_invalid` | Bearer API Key 无效 | HTTP 401 | API Key 无效 |
+| `request_invalid` | 请求体、参数或 UUID 格式无效 | HTTP 422 | 请求参数无效 |
+| `conversation_not_found` | 会话不存在或不属于该账号 | HTTP 404 | 会话不存在 |
+| `account_not_found` | 账号不存在 | HTTP 404 | 账号不存在 |
+| `artifact_not_found` | 产物不存在或不属于该账号 | HTTP 404 | 产物不存在 |
+| `model_service_unavailable` | 模型列表上游不可用 | HTTP 502 | 模型服务暂不可用，请稍后重试 |
+| `agent_incomplete` | Agent 流结束但未发出 `done` | SSE `error` | 本轮生成未正常结束，请重试 |
+| `agent_failed` | Agent、模型或工具运行中抛出异常 | SSE `error` | 本轮处理失败，请稍后重试 |
+| `resource_not_found` | API 路由或其他资源不存在 | HTTP 404 | 请求的资源不存在 |
+| `method_not_allowed` | API 请求方法不支持 | HTTP 405 | 请求方法不受支持 |
+| `internal_error` | 未分类的 API 服务端异常 | HTTP 500 | 服务内部错误，请稍后重试 |
 
 `GET /api/models` 返回已安装的 `models` 列表和服务端配置的 `default_model`。网页优先选择已安装的默认模型。
 
