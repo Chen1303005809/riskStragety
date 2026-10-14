@@ -33,6 +33,7 @@
 - 参数集中：交易所、合约代码、阈值、方向、边界开关等定义为模块级大写常量；不得把新规则写成额外下单逻辑。
 - `__init__(self, pid: int) -> None` 中先设置 `self.symbolList`、与其一一对应的 `self.exchangeList`、`self.npid` 和策略状态，再调用 `super().__init__()`；之后设置 `instrument`、`exchange` 等基类字段。
 - 实现类型注解齐全的 `onStart`、`onStop`、`onTick` 回调。生命周期回调调用对应父类方法；`onTick(self, tick: VtTickData) -> None` 对有效 tick 调用 `super().onTick(tick)`，再校验并处理订阅合约的 `tick.vtSymbol` / `tick.lastPrice`。
+- 策略运行日志使用基类公开的 `self.output(content)`，不要使用 `print`、标准库 `logging` 或直接调用引擎接口。`onStart()` 调用 `super().onStart()` 后，再输出一条简短的策略启动日志，说明正在监控的合约和规则摘要；`onStop()` 调用父类方法即可，父类已记录停止日志。每次触发预警时，在 `putEvent()` 前输出合约、当前价格和触发条件，便于从日志追溯通知原因。不要逐笔记录正常行情；坏 tick 只有在日志有助于定位问题且不会造成高频刷屏时才记录。
 - 条件满足时调用 `self.putEvent(中文通知内容, "warning")`；通过实例状态防止每个 tick 重复报警。需求未给复位条件时，使用同一阈值的反向条件重新布防，不得编造第二条价格线。
 - R1 在行情回调中判断阈值方向；R2 用实例状态机按到达顺序逐 tick 更新；R3 缓存每个订阅合约的最新价，再按需求的且/或逻辑判断。不得假设回调同时带来多个合约行情。
 - 比较语义严格按需求实现（超过/突破=大于，跌破/低于=小于，达到=大于等于）；默认严格边界并在最终中文说明中交代。浮点精度处理方式须在注释中说明。
