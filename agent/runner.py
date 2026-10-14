@@ -20,11 +20,26 @@ from agent.contracts import (
     ModelGateway,
     ToolCall,
 )
+from agent.exchange_lookup import lookup_exchange_by_contract_code
 from agent.prompt import build_system_prompt
 
 
 MAX_TOOL_ROUNDS = 12
 TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_exchange_by_contract_code",
+            "description": "离线查询境内六家期货交易所的期货合约代码，返回品种、交易所和交割月状态；不支持期权。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "contract_code": {"type": "string", "description": "期货合约代码，例如 rb2710"},
+                },
+                "required": ["contract_code"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -316,6 +331,11 @@ class AgentRunner:
         options: dict[str, int | float],
     ) -> tuple[dict[str, Any], Artifact | None]:
         args = call.arguments
+        if call.name == "lookup_exchange_by_contract_code":
+            contract_code = args.get("contract_code")
+            if not isinstance(contract_code, str):
+                raise ValueError("contract_code 必须是字符串")
+            return lookup_exchange_by_contract_code(contract_code), None
         if call.name == "list_interface_files":
             return {"files": await self._interfaces.list_files()}, None
         if call.name == "read_interface_file":

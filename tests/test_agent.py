@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -64,7 +66,7 @@ class ScriptedModel:
         self, model, messages, tools, *, options, think
     ) -> AsyncIterator[ModelChunk]:
         assert model == "model-a"
-        assert len(tools) == 5
+        assert len(tools) == 6
         self.seen.append(messages.copy())
         self.settings_seen.append((options.copy(), think))
         for chunk in self.rounds[len(self.seen) - 1]:
@@ -87,6 +89,90 @@ def test_preserved_prompt_is_prefixed_without_editing_original() -> None:
     assert "check_python_syntax" in assembled
     assert "run_functional_test" in assembled
     assert "write_generated_file" in assembled
+    assert "lookup_exchange_by_contract_code" in assembled
+    assert "不再询问交易所" in assembled
+
+
+def test_exchange_lookup_success_flows_into_strategy_generation_without_exchange_question() -> None:
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    next_month = (now.replace(day=1) + timedelta(days=32)).replace(day=1)
+    contract_code = f"rb{next_month.strftime('%y%m')}"
+    source = "class RiskStrategy(RHTemplate):\n    pass\n"
+    model = ScriptedModel(
+        [
+            [ModelChunk(tool_calls=(ToolCall(
+                "lookup_exchange_by_contract_code", {"contract_code": contract_code}
+            ),))],
+            [ModelChunk(tool_calls=(ToolCall("list_interface_files", {}),))],
+            [ModelChunk(tool_calls=(ToolCall("read_interface_file", {"filename": "external_head.py"}),))],
+            [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("write_generated_file", {"source": source}),))],
+            [ModelChunk(content="已生成策略。")],
+        ]
+    )
+    artifacts = MemoryArtifacts()
+
+    events = collect(
+        AgentRunner(model, MemoryInterfaces(), artifacts, functional_tester=PassingFunctionalTester()),
+        message=f"{contract_code} 超过 3800 时提醒",
+        history=[], model="model-a", account_id="alice",
+    )
+
+    lookup_result = model.seen[1][-1]["content"]
+    assert '"exchange_code": "SHFE"' in lookup_result
+    assert '"status": "matched"' in lookup_result
+    assert artifacts.created == [("RiskStrategy.py", source, "alice")]
+    assert events[-1].data["content"] == "已生成策略。"
+    assert "交易所" not in events[-1].data["content"]
+
+
+def test_unrecognized_contract_asks_only_for_exchange() -> None:
+    contract_code = "UNKNOWN2611"
+    expected_status = "unrecognized"
+    expected_followup = "合约所属交易所"
+    model = ScriptedModel(
+        [
+            [ModelChunk(tool_calls=(ToolCall(
+                "lookup_exchange_by_contract_code", {"contract_code": contract_code}
+            ),))],
+            [ModelChunk(content=f"【参数补充请求】\n{expected_followup}")],
+        ]
+    )
+
+    events = collect(
+        AgentRunner(model, MemoryInterfaces(), MemoryArtifacts()),
+        message=f"{contract_code} 超过 3800 时提醒",
+        history=[], model="model-a", account_id="alice",
+    )
+
+    assert f'"status": "{expected_status}"' in model.seen[1][-1]["content"]
+    assert events[-1].kind == "done"
+    assert expected_followup in events[-1].data["content"]
+
+
+def test_expired_contract_asks_for_a_valid_contract_code() -> None:
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    previous_month = now.replace(day=1) - timedelta(days=1)
+    contract_code = f"rb{previous_month.strftime('%y%m')}"
+    model = ScriptedModel(
+        [
+            [ModelChunk(tool_calls=(ToolCall(
+                "lookup_exchange_by_contract_code", {"contract_code": contract_code}
+            ),))],
+            [ModelChunk(content="【参数补充请求】\n请提供有效合约代码。")],
+        ]
+    )
+
+    events = collect(
+        AgentRunner(model, MemoryInterfaces(), MemoryArtifacts()),
+        message=f"{contract_code} 超过 3800 时提醒",
+        history=[], model="model-a", account_id="alice",
+    )
+
+    assert '"status": "expired"' in model.seen[1][-1]["content"]
+    assert events[-1].kind == "done"
+    assert "提供有效合约代码" in events[-1].data["content"]
 
 
 def test_read_write_reply_flow() -> None:

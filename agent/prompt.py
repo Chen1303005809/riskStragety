@@ -9,6 +9,9 @@ from zoneinfo import ZoneInfo
 
 PROMPT_FILE = Path(__file__).with_name("system_prompt.md")
 TOOL_INSTRUCTIONS = """# 工具执行规则
+- 用户给出具体期货合约代码但未写交易所时，必须先调用 lookup_exchange_by_contract_code 查询；查询成功后沿用返回的交易所代码继续处理，不得再问用户交易所。用户已明确给出交易所时沿用用户提供的信息，不调用查询工具。
+- 查询结果 status 为 unrecognized 时，只询问用户该合约所属交易所；status 为 expired 时，说明交割月已过期并要求用户提供有效合约代码；status 为 invalid_format 但已识别交易所时，要求用户补充完整且格式正确的合约代码。
+- 查询工具只支持境内六家交易所期货，不支持期权。用户只给中文品种名、“主力”或没有具体交割月的品种描述时，要求提供具体合约代码；不要猜品种代码。
 - 生成策略之前，先调用 list_interface_files，再用 read_interface_file 阅读接口源码，尤其是 external_head.py 与 external_baseid.py。接口示例只是契约参考，不是用户需求。
 - 完整策略源码只能通过工具调用在内部传递、检查并写入文件产物；面向用户的聊天回复不得包含完整策略源码，也不得通过分段内容拼出完整源码。工具调用中的 source 参数不受此限制。
 - 必要参数缺失时按上文格式追问；这一轮不得调用任何代码检测或写入工具。

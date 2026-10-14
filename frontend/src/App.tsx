@@ -64,6 +64,7 @@ function activityText(phase: string, tool?: string): string {
   if (phase === 'started') return '正在理解需求…';
   if (phase === 'tool_finished') return '正在继续生成…';
   if (phase === 'tool_started') {
+    if (tool === 'lookup_exchange_by_contract_code') return '正在查询交易所…';
     if (tool === 'list_interface_files') return '正在查看接口文件…';
     if (tool === 'read_interface_file') return '正在阅读接口源码…';
     if (tool === 'write_generated_file') return '正在保存策略文件…';
