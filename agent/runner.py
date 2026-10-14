@@ -6,6 +6,7 @@ import ast
 import hashlib
 import inspect
 import json
+import re
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -30,7 +31,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "lookup_exchange_by_contract_code",
-            "description": "离线查询境内六家期货交易所的期货合约代码，返回品种、交易所和交割月状态；不支持期权。",
+            "description": "离线查询境内六家期货交易所的期货合约代码，返回品种、交易所和交割月状态；canonical_contract_code 保留映射表大小写，是生成源码时唯一可用的合约代码；contract_code 仅供识别且统一大写。不支持期权。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -122,10 +123,34 @@ def _failure_context(message: str, tool_failures: Sequence[str]) -> str:
 class _ValidationState:
     syntax_passed: set[str] = field(default_factory=set)
     functional_passed: set[str] = field(default_factory=set)
+    canonical_contract_codes: dict[str, str] = field(default_factory=dict)
 
 
 def _source_digest(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _contract_code_casing_error(
+    source: str, canonical_contract_codes: dict[str, str]
+) -> str | None:
+    """Reject every source occurrence of a mapped contract with noncanonical case."""
+    for normalized_code, canonical_code in canonical_contract_codes.items():
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_]){re.escape(normalized_code)}(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+        wrong_case = [
+            match.group(0)
+            for match in pattern.finditer(source)
+            if match.group(0) != canonical_code
+        ]
+        if wrong_case:
+            examples = ", ".join(repr(value) for value in wrong_case[:3])
+            return (
+                f"源码中的合约代码大小写不符合映射工具结果：应逐字使用 "
+                f"{canonical_code!r}，发现 {examples}。请修正所有对应代码字符串。"
+            )
+    return None
 
 
 def _coalesce_adjacent_turns(turns: Sequence[ChatTurn]) -> list[ChatTurn]:
@@ -335,7 +360,12 @@ class AgentRunner:
             contract_code = args.get("contract_code")
             if not isinstance(contract_code, str):
                 raise ValueError("contract_code 必须是字符串")
-            return lookup_exchange_by_contract_code(contract_code), None
+            result = lookup_exchange_by_contract_code(contract_code)
+            normalized_code = result.get("contract_code")
+            canonical_code = result.get("canonical_contract_code")
+            if isinstance(normalized_code, str) and isinstance(canonical_code, str):
+                validation.canonical_contract_codes[normalized_code] = canonical_code
+            return result, None
         if call.name == "list_interface_files":
             return {"files": await self._interfaces.list_files()}, None
         if call.name == "read_interface_file":
@@ -349,6 +379,12 @@ class AgentRunner:
                 raise ValueError("source 必须是字符串")
             digest = _source_digest(source)
             result = check_python_syntax(source)
+            if result["passed"]:
+                casing_error = _contract_code_casing_error(
+                    source, validation.canonical_contract_codes
+                )
+                if casing_error:
+                    result = {**result, "passed": False, "error": casing_error}
             if result["passed"]:
                 validation.syntax_passed.add(digest)
             else:
@@ -394,6 +430,11 @@ class AgentRunner:
                 raise ValueError("保存前必须先通过同一份源码的 check_python_syntax")
             if digest not in validation.functional_passed:
                 raise ValueError("保存前必须先通过同一份源码的 run_functional_test")
+            casing_error = _contract_code_casing_error(
+                source, validation.canonical_contract_codes
+            )
+            if casing_error:
+                raise ValueError(casing_error)
             try:
                 source_tree = ast.parse(source, feature_version=(3, 7))
             except SyntaxError as exc:

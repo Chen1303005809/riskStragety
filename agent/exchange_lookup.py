@@ -107,6 +107,7 @@ def lookup_exchange_by_contract_code(
 
     base: dict[str, Any] = {
         "contract_code": normalized,
+        "canonical_contract_code": None,
         "product_code": None,
         "product_name": None,
         "exchange_code": None,
@@ -136,6 +137,7 @@ def lookup_exchange_by_contract_code(
         "exchange_name": EXCHANGE_NAMES[exchange],
     })
     suffix = normalized[len(product_upper):]
+    base["canonical_contract_code"] = f"{product_code}{suffix}"
     parsed_month = _parse_month(suffix, exchange, current.year)
     if parsed_month is None:
         base.update({
