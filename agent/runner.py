@@ -89,7 +89,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "write_generated_file",
-            "description": "保存已通过语法和功能检测的完整策略；根据继承 RHTemplate 的策略类名自动命名；不得用于参数追问轮。",
+            "description": "保存已通过语法和功能检测的完整策略；策略类标识符必须为 MyPython_Obj，文件根据其 name 属性自动命名为 <name>.py；不得用于参数追问轮。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -128,6 +128,51 @@ class _ValidationState:
 
 def _source_digest(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _strategy_filename(strategy_class: ast.ClassDef) -> str:
+    """Return a safe artifact filename from the strategy class's literal name."""
+    if strategy_class.name != "MyPython_Obj":
+        raise ValueError("策略主类的 Python 类名必须是 MyPython_Obj")
+
+    name_values: list[ast.expr] = []
+    for statement in strategy_class.body:
+        if isinstance(statement, ast.Assign):
+            name_values.extend(
+                statement.value
+                for target in statement.targets
+                if isinstance(target, ast.Name) and target.id == "name"
+            )
+        elif (
+            isinstance(statement, ast.AnnAssign)
+            and isinstance(statement.target, ast.Name)
+            and statement.target.id == "name"
+            and statement.value is not None
+        ):
+            name_values.append(statement.value)
+
+    if len(name_values) != 1:
+        raise ValueError("策略类必须且只能定义一次 name 字符串属性")
+    try:
+        strategy_name = ast.literal_eval(name_values[0])
+    except (ValueError, TypeError, SyntaxError) as exc:
+        raise ValueError("策略类的 name 属性必须是字符串字面量") from exc
+    if not isinstance(strategy_name, str):
+        raise ValueError("策略类的 name 属性必须是字符串")
+
+    filename = f"{strategy_name}.py"
+    if (
+        not strategy_name
+        or strategy_name != strategy_name.strip()
+        or len(filename) > 120
+        or strategy_name.startswith(".")
+        or strategy_name.lower().endswith(".py")
+        or "/" in strategy_name
+        or "\\" in strategy_name
+        or any(ord(char) < 32 or ord(char) == 127 for char in strategy_name)
+    ):
+        raise ValueError("策略类的 name 属性必须是有效的纯文件名，且不含 .py 后缀")
+    return filename
 
 
 def _contract_code_casing_error(
@@ -451,7 +496,7 @@ class AgentRunner:
             if len(strategy_classes) > 1:
                 raise ValueError("策略源码只能包含一个直接继承 RHTemplate 的顶层策略类")
             if strategy_classes:
-                filename = f"{strategy_classes[0].name}.py"
+                filename = _strategy_filename(strategy_classes[0])
             else:
                 raise ValueError("策略源码必须包含一个直接继承 RHTemplate 的顶层策略类")
             create = self._artifacts.create

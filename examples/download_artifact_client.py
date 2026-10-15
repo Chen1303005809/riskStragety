@@ -16,7 +16,7 @@ CHUNK_SIZE = 64 * 1024
 
 
 def strategy_filename(source: str) -> str:
-    """Derive the .py filename from the strategy class in the decoded source."""
+    """Derive the .py filename from the strategy class's name attribute."""
     source_tree = ast.parse(source)
     strategy_classes = [
         node
@@ -29,7 +29,39 @@ def strategy_filename(source: str) -> str:
     ]
     if len(strategy_classes) != 1:
         raise ValueError("源码必须包含且只包含一个直接继承 RHTemplate 的顶层策略类")
-    return f"{strategy_classes[0].name}.py"
+    name_values = [
+        statement.value
+        for statement in strategy_classes[0].body
+        if isinstance(statement, ast.Assign)
+        for target in statement.targets
+        if isinstance(target, ast.Name) and target.id == "name"
+    ]
+    name_values.extend(
+        statement.value
+        for statement in strategy_classes[0].body
+        if isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.target, ast.Name)
+        and statement.target.id == "name"
+        and statement.value is not None
+    )
+    if len(name_values) != 1:
+        raise ValueError("策略类必须且只能定义一次 name 字符串属性")
+    name = ast.literal_eval(name_values[0])
+    if (
+        not isinstance(name, str)
+        or not name
+        or name != name.strip()
+        or name.startswith(".")
+        or name.lower().endswith(".py")
+        or "/" in name
+        or "\\" in name
+        or any(ord(char) < 32 or ord(char) == 127 for char in name)
+    ):
+        raise ValueError("策略类的 name 属性必须是有效的纯文件名，且不含 .py 后缀")
+    filename = f"{name}.py"
+    if len(filename) > 120:
+        raise ValueError("策略文件名不能超过 120 个字符")
+    return filename
 
 
 def download_artifact_source(
