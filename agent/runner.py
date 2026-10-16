@@ -26,6 +26,11 @@ from agent.prompt import build_system_prompt
 
 
 MAX_TOOL_ROUNDS = 12
+TOOL_FAILURE_REPAIR_PROMPT = (
+    "上一个工具结果包含 error 或 passed=false。请先检查该工具结果中的具体诊断，"
+    "直接通过工具修正候选策略；功能检测失败时，先重新调用 check_python_syntax，"
+    "通过后再调用 run_functional_test。不要只向用户描述失败，也不要保存未通过检测的源码。"
+)
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -267,6 +272,7 @@ class AgentRunner:
         visible_content: list[str] = []
         created: list[Artifact] = []
         tool_failures: list[str] = []
+        tool_failure_repair_pending = False
         validation = _ValidationState()
         requirements = [*history, ChatTurn("user", message)]
         yield AgentEvent("status", {"phase": "started", "model": model})
@@ -304,6 +310,13 @@ class AgentRunner:
                 return
 
             if not calls:
+                if tool_failure_repair_pending:
+                    assistant_content = "".join(round_content)
+                    if assistant_content.strip():
+                        messages.append({"role": "assistant", "content": assistant_content})
+                    messages.append({"role": "user", "content": TOOL_FAILURE_REPAIR_PROMPT})
+                    tool_failure_repair_pending = False
+                    continue
                 content = "".join(visible_content)
                 if not content.strip():
                     if not created:
@@ -350,6 +363,7 @@ class AgentRunner:
                     ],
                 }
             )
+            tool_failure_repair_pending = False
             for call in calls:
                 yield AgentEvent("status", {"phase": "tool_started", "tool": call.name})
                 try:
@@ -365,6 +379,7 @@ class AgentRunner:
                 except (ValueError, OSError) as exc:
                     result, artifact = {"error": str(exc)}, None
                 if result.get("error") or result.get("passed") is False:
+                    tool_failure_repair_pending = True
                     tool_failures.append(
                         f"{call.name}: {json.dumps(result, ensure_ascii=False)}"
                     )
