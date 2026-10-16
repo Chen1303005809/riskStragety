@@ -36,11 +36,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "lookup_exchange_by_contract_code",
-            "description": "离线查询境内六家期货交易所的期货合约代码，返回品种、交易所和交割月状态；canonical_contract_code 保留映射表大小写，是生成源码时唯一可用的合约代码；contract_code 仅供识别且统一大写。不支持期权。",
+            "description": "离线查询境内六家期货交易所的期货合约代码，返回品种、交易所和交割月状态。既可查询用户明确提供的代码，也可查询从可识别的品种名称与交割月份推导出的候选代码；canonical_contract_code 保留映射表大小写，是生成源码时唯一可用的合约代码，contract_code 仅供识别且统一大写。不支持期权。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "contract_code": {"type": "string", "description": "期货合约代码，例如 rb2710"},
+                    "contract_code": {"type": "string", "description": "用户明确给出或根据品种名称和交割月份推导出的境内期货合约代码，例如 rb2710"},
                 },
                 "required": ["contract_code"],
             },

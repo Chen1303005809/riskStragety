@@ -80,17 +80,28 @@ def collect(runner: AgentRunner, **kwargs):
     return asyncio.run(read())
 
 
-def test_preserved_prompt_is_prefixed_without_editing_original() -> None:
+def test_current_time_is_a_volatile_suffix_after_the_stable_prompt() -> None:
     original = PROMPT_FILE.read_text(encoding="utf-8").removesuffix("\n")
-    assembled = build_system_prompt()
-    assert assembled.startswith(original + "\n\n# 当前时间")
-    assert "list_interface_files" in assembled
-    assert "read_interface_file" in assembled
-    assert "check_python_syntax" in assembled
-    assert "run_functional_test" in assembled
-    assert "write_generated_file" in assembled
-    assert "lookup_exchange_by_contract_code" in assembled
-    assert "不再询问交易所" in assembled
+    first = build_system_prompt(
+        now=datetime(2026, 10, 16, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    )
+    second = build_system_prompt(
+        now=datetime(2026, 10, 17, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    )
+    stable_first, time_first = first.rsplit("\n\n# 当前时间\n", 1)
+    stable_second, time_second = second.rsplit("\n\n# 当前时间\n", 1)
+
+    assert stable_first == stable_second
+    assert stable_first.startswith(original + "\n\n# 工具执行规则")
+    assert time_first != time_second
+    assert first.endswith("代码文件头、元数据及所有输出中的日期必须使用该当天日期。")
+    assert "list_interface_files" in stable_first
+    assert "read_interface_file" in stable_first
+    assert "check_python_syntax" in stable_first
+    assert "run_functional_test" in stable_first
+    assert "write_generated_file" in stable_first
+    assert "lookup_exchange_by_contract_code" in stable_first
+    assert "不再询问交易所" in stable_first
 
 
 def test_exchange_lookup_success_flows_into_strategy_generation_without_exchange_question() -> None:
