@@ -94,7 +94,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "write_generated_file",
-            "description": "保存已通过语法和功能检测的完整策略；策略类标识符必须为 MyPython_Obj，文件根据其 name 属性自动命名为 <name>.py；不得用于参数追问轮。",
+            "description": "保存已通过语法和功能检测的完整策略；策略类标识符必须为 My_PythonObj，文件根据其 name 属性自动命名为 <name>.py；不得用于参数追问轮。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -137,8 +137,8 @@ def _source_digest(source: str) -> str:
 
 def _strategy_filename(strategy_class: ast.ClassDef) -> str:
     """Return a safe artifact filename from the strategy class's literal name."""
-    if strategy_class.name != "MyPython_Obj":
-        raise ValueError("策略主类的 Python 类名必须是 MyPython_Obj")
+    if strategy_class.name != "My_PythonObj":
+        raise ValueError("策略主类的 Python 类名必须是 My_PythonObj")
 
     name_values: list[ast.expr] = []
     for statement in strategy_class.body:

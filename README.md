@@ -115,7 +115,7 @@ curl -X POST http://127.0.0.1:8765/api/artifacts/download \
   -o strategy.py
 ```
 
-下载接口按 `artifact_id` 查找文件，并使用请求中的 `account_id` 核对 SQLite 产物归属。成功响应以 `application/octet-stream` 分块发送原始 UTF-8 文件字节，并通过 `Content-Disposition` 提供 `.py` 文件名；浏览器客户端可读取响应字节并生成 `.py` 文件。生成文件名由唯一 `RHTemplate` 策略主类的 `name` 属性决定，例如 `MyPython_Obj` 类的 `name = "RiskAlertStrategy"` 会保存为 `RiskAlertStrategy.py`。文件名只允许直接的 `.py` 文件名；接口读取和产物下载都拒绝路径穿越及符号链接。人工清理时删除 `artifacts/` 下对应的 `.py` 文件；迁移前旧产物若有 `.json` sidecar，也可一并清理。
+下载接口按 `artifact_id` 查找文件，并使用请求中的 `account_id` 核对 SQLite 产物归属。成功响应以 `application/octet-stream` 分块发送原始 UTF-8 文件字节，并通过 `Content-Disposition` 提供 `.py` 文件名；浏览器客户端可读取响应字节并生成 `.py` 文件。生成文件名由唯一 `RHTemplate` 策略主类的 `name` 属性决定，例如 `My_PythonObj` 类的 `name = "RiskAlertStrategy"` 会保存为 `RiskAlertStrategy.py`。文件名只允许直接的 `.py` 文件名；接口读取和产物下载都拒绝路径穿越及符号链接。人工清理时删除 `artifacts/` 下对应的 `.py` 文件；迁移前旧产物若有 `.json` sidecar，也可一并清理。
 
 Python 客户端示例见 [`examples/download_artifact_client.py`](examples/download_artifact_client.py)，它会分块接收二进制响应并增量解码为 UTF-8 源码文本。运行前，在文件末尾的 `if __name__ == "__main__"` 代码块中填写 API Key、账号 ID 和 artifact ID，并按需修改服务地址与输出文件名。
 
