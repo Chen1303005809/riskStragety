@@ -170,13 +170,9 @@ def _strategy_filename(strategy_class: ast.ClassDef) -> str:
         not strategy_name
         or strategy_name != strategy_name.strip()
         or len(filename) > 120
-        or strategy_name.startswith(".")
-        or strategy_name.lower().endswith(".py")
-        or "/" in strategy_name
-        or "\\" in strategy_name
-        or any(ord(char) < 32 or ord(char) == 127 for char in strategy_name)
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", strategy_name) is None
     ):
-        raise ValueError("策略类的 name 属性必须是有效的纯文件名，且不含 .py 后缀")
+        raise ValueError("策略类的 name 属性必须是英文名称（英文字母开头，仅含英文字母、数字、下划线和连字符）")
     return filename
 
 

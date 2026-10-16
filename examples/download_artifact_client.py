@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import codecs
 import json
+import re
 import sys
 from pathlib import Path
 from urllib.error import HTTPError
@@ -51,13 +52,9 @@ def strategy_filename(source: str) -> str:
         not isinstance(name, str)
         or not name
         or name != name.strip()
-        or name.startswith(".")
-        or name.lower().endswith(".py")
-        or "/" in name
-        or "\\" in name
-        or any(ord(char) < 32 or ord(char) == 127 for char in name)
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", name) is None
     ):
-        raise ValueError("策略类的 name 属性必须是有效的纯文件名，且不含 .py 后缀")
+        raise ValueError("策略类的 name 属性必须是英文名称（英文字母开头，仅含英文字母、数字、下划线和连字符）")
     filename = f"{name}.py"
     if len(filename) > 120:
         raise ValueError("策略文件名不能超过 120 个字符")
