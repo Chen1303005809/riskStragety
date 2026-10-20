@@ -29,11 +29,12 @@ from agent.prompt import build_system_prompt
 
 
 MAX_TOOL_ROUNDS = 12
-MAX_IDENTICAL_FAILED_TOOL_CALLS = 2
+MAX_IDENTICAL_FAILED_TOOL_CALLS = 1
 TOOL_FAILURE_REPAIR_PROMPT = (
     "上一个工具结果包含 error 或 passed=false。请先检查该工具结果中的具体诊断，"
-    "直接通过工具修正候选策略；功能检测失败时，先重新调用 check_python_syntax，"
-    "通过后再调用 run_functional_test。不要只向用户描述失败，也不要保存未通过检测的源码。"
+    "直接修改候选源码来修复失败原因；不得对完全相同的参数再次调用失败的工具。"
+    "功能检测失败时，先重新调用 check_python_syntax，通过后再调用 run_functional_test。"
+    "不要只向用户描述失败，也不要保存未通过检测的源码。"
 )
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -385,12 +386,13 @@ class AgentRunner:
                 assistant_message["reasoning_content"] = "".join(round_reasoning_content)
             messages.append(assistant_message)
             tool_failure_repair_pending = False
-            for call in calls:
+            for call_index, call in enumerate(calls, start=1):
                 signature = _tool_call_signature(call)
                 failure_count = failed_tool_call_counts.get(signature, 0)
                 if failure_count >= MAX_IDENTICAL_FAILED_TOOL_CALLS:
                     message = (
-                        f"工具 {call.name} 使用相同参数已失败 {failure_count} 次，"
+                        f"模型在第 {round_index + 1} 轮第 {call_index} 个工具调用中，"
+                        f"对工具 {call.name} 使用相同参数再次调用；此前已失败 {failure_count} 次，"
                         "已停止重复调用"
                     )
                     raise AgentError(
@@ -415,6 +417,7 @@ class AgentRunner:
                     tool_failure_repair_pending = True
                     failed_tool_call_counts[signature] = failure_count + 1
                     tool_failures.append(
+                        f"第 {round_index + 1} 轮第 {call_index}/{len(calls)} 个工具调用，"
                         f"{call.name}: {json.dumps(result, ensure_ascii=False)}"
                     )
                 else:
@@ -433,6 +436,9 @@ class AgentRunner:
                     }
                 )
                 yield AgentEvent("status", {"phase": "tool_finished", "tool": call.name})
+
+            if tool_failure_repair_pending:
+                messages.append({"role": "user", "content": TOOL_FAILURE_REPAIR_PROMPT})
 
         message = "Agent 未能完成请求"
         raise AgentError(
