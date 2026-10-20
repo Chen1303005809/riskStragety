@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
@@ -37,6 +38,7 @@ from backend.security import Principal, require_principal
 
 
 ARTIFACT_STREAM_CHUNK_SIZE = 64 * 1024
+logger = logging.getLogger(__name__)
 
 ERROR_MESSAGES = {
     "ok": "",
@@ -323,10 +325,19 @@ def create_app(
                         conversation_id, assistant_message_id, content, "failed"
                     )
                 except Exception:
-                    pass
+                    logger.exception(
+                        "agent_failed_turn_persistence_failed conversation_id=%s",
+                        conversation_id,
+                    )
                 turn_finalized = True
 
             try:
+                logger.info(
+                    "agent_request_started conversation_id=%s provider=%s model=%s",
+                    conversation_id,
+                    payload.provider,
+                    selected_model,
+                )
                 async with conversation_locks.hold(conversation_id):
                     history_rows, _, assistant_message_id = await monitoring.begin_turn(
                         payload.account_id, conversation_id, payload.message
@@ -371,6 +382,15 @@ def create_app(
                             yield _sse(done_event, conversation_id=conversation_id)
                             return
                         if event.kind == "error":
+                            logger.error(
+                                "agent_error_event conversation_id=%s provider=%s model=%s "
+                                "partial_chars=%d event_data=%s",
+                                conversation_id,
+                                payload.provider,
+                                selected_model,
+                                len("".join(partial_content)),
+                                json.dumps(event.data, ensure_ascii=False, default=str)[:2_000],
+                            )
                             await finalize_failed_turn("".join(partial_content))
                             yield _sse(
                                 AgentEvent(
@@ -385,6 +405,14 @@ def create_app(
                             return
                         yield _sse(event, conversation_id=conversation_id)
 
+                    logger.warning(
+                        "agent_stream_incomplete conversation_id=%s provider=%s model=%s "
+                        "partial_chars=%d",
+                        conversation_id,
+                        payload.provider,
+                        selected_model,
+                        len("".join(partial_content)),
+                    )
                     await finalize_failed_turn("".join(partial_content))
                     yield _sse(
                         AgentEvent(
@@ -397,6 +425,12 @@ def create_app(
                         conversation_id=conversation_id,
                     )
             except asyncio.CancelledError:
+                logger.info(
+                    "agent_request_interrupted conversation_id=%s provider=%s model=%s",
+                    conversation_id,
+                    payload.provider,
+                    selected_model,
+                )
                 if assistant_message_id is not None and not turn_finalized:
                     try:
                         await monitoring.finish_turn(
@@ -409,10 +443,27 @@ def create_app(
                         turn_finalized = True
                 raise
             except Exception as exc:
+                exception_detail = str(exc).strip() or (
+                    f"{type(exc).__name__}（异常消息为空）"
+                )
+                logger.exception(
+                    "agent_request_failed conversation_id=%s provider=%s model=%s "
+                    "assistant_message_id=%s exception_type=%s detail=%s",
+                    conversation_id,
+                    payload.provider,
+                    selected_model,
+                    assistant_message_id,
+                    type(exc).__name__,
+                    exception_detail[:2_000],
+                )
                 if assistant_message_id is not None and not turn_finalized:
                     failure_context = getattr(exc, "failure_context", None)
                     if not isinstance(failure_context, str) or not failure_context.strip():
-                        failure_context = f"【上轮失败诊断】\n本轮失败：{exc}"
+                        failure_context = (
+                            f"【上轮失败诊断】\n本轮失败：{exception_detail}"
+                        )
+                    elif failure_context.rstrip().endswith("本轮失败："):
+                        failure_context = f"{failure_context}{exception_detail}"
                     failed_content = "".join(partial_content)
                     if failed_content.strip():
                         failed_content = f"{failed_content}\n\n{failure_context}"

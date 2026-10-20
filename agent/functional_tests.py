@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from agent.skills import SkillLoader
 
 
 TEST_CASE_SKILL_ID = "test_case_builder"
+logger = logging.getLogger(__name__)
 MAX_TEST_CASES = 24
 MAX_TICKS_PER_CASE = 200
 MAX_TOTAL_TICKS = 2_000
@@ -135,7 +137,16 @@ class SkillTestCaseBuilder:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            raise FunctionalTestError(f"测试用例构造模型调用失败：{exc}") from exc
+            detail = str(exc).strip() or f"{type(exc).__name__}（异常消息为空）"
+            logger.exception(
+                "functional_test_case_builder_failed model=%s source_bytes=%d "
+                "exception_type=%s detail=%s",
+                model,
+                len(source.encode("utf-8", errors="replace")),
+                type(exc).__name__,
+                detail[:2_000],
+            )
+            raise FunctionalTestError(f"测试用例构造模型调用失败：{detail}") from exc
 
         if len(calls) != 1 or calls[0].name != "submit_test_cases":
             raise FunctionalTestError("测试用例 Skill 必须且只能提交一次 submit_test_cases")
@@ -167,7 +178,24 @@ class SkillFunctionalTester:
             model=model,
             options=options,
         )
-        results = await self._sandbox.run(source, cases)
+        logger.info(
+            "functional_test_cases_built model=%s case_count=%d tick_count=%d",
+            model,
+            len(cases),
+            sum(len(case.ticks) for case in cases),
+        )
+        try:
+            results = await self._sandbox.run(source, cases)
+        except Exception as exc:
+            logger.exception(
+                "functional_test_sandbox_failed model=%s case_count=%d "
+                "exception_type=%s detail=%s",
+                model,
+                len(cases),
+                type(exc).__name__,
+                (str(exc).strip() or f"{type(exc).__name__}（异常消息为空）")[:2_000],
+            )
+            raise
         if not isinstance(results, list) or len(results) != len(cases):
             raise FunctionalTestError("沙盒返回的测试用例数量与提交数量不一致")
         for case, result in zip(cases, results):
@@ -196,8 +224,21 @@ class SkillFunctionalTester:
                     or not isinstance(actual, int)
                 ):
                     raise FunctionalTestError("沙盒返回了无效的预警数量记录")
+        passed = all(result["passed"] for result in results)
+        failed_case_indexes = [
+            index for index, result in enumerate(results, start=1)
+            if result["passed"] is False
+        ]
+        logger.info(
+            "functional_test_sandbox_finished model=%s passed=%s case_count=%d "
+            "failed_case_indexes=%s",
+            model,
+            passed,
+            len(results),
+            failed_case_indexes,
+        )
         return {
-            "passed": all(result["passed"] for result in results),
+            "passed": passed,
             "case_count": len(results),
             "cases": results,
         }

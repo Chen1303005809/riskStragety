@@ -6,6 +6,7 @@ import ast
 import hashlib
 import inspect
 import json
+import logging
 import re
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
@@ -36,6 +37,7 @@ from agent.prompt import build_system_prompt
 
 MAX_TOOL_ROUNDS = 12
 MAX_IDENTICAL_FAILED_TOOL_CALLS = 1
+logger = logging.getLogger(__name__)
 TOOL_FAILURE_REPAIR_PROMPT = (
     "上一个工具结果包含 error 或 passed=false。请先检查该工具结果中的具体诊断，"
     "直接修改候选源码来修复失败原因；不得对完全相同的参数再次调用失败的工具。"
@@ -149,6 +151,10 @@ def _source_digest(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
+def _source_digest_for_log(source: str) -> str:
+    return hashlib.sha256(source.encode("utf-8", errors="backslashreplace")).hexdigest()
+
+
 def _tool_call_signature(name: str, arguments: dict[str, Any]) -> str:
     """Return a stable signature for detecting an unchanged failed tool call."""
     return json.dumps(
@@ -157,6 +163,41 @@ def _tool_call_signature(name: str, arguments: dict[str, Any]) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _tool_call_signature_digest(name: str, arguments: dict[str, Any]) -> str:
+    signature = _tool_call_signature(name, arguments)
+    return hashlib.sha256(signature.encode("utf-8", errors="backslashreplace")).hexdigest()[:16]
+
+
+def _exception_detail(exc: Exception) -> str:
+    detail = str(exc).strip()
+    return detail or f"{type(exc).__name__}（异常消息为空）"
+
+
+def _tool_result_log_summary(result: dict[str, Any]) -> str:
+    """Summarize failed tool results without logging candidate source code."""
+    summary: dict[str, Any] = {"passed": result.get("passed")}
+    error = result.get("error")
+    if error is not None:
+        summary["error"] = str(error)[:2_000]
+
+    cases = result.get("cases")
+    if isinstance(cases, list):
+        failed_cases = []
+        for index, case in enumerate(cases, start=1):
+            if not isinstance(case, dict) or case.get("passed") is False:
+                item: dict[str, Any] = {"index": index}
+                if isinstance(case, dict):
+                    for key in ("expected_warning_count", "actual_warning_count"):
+                        if key in case:
+                            item[key] = case[key]
+                    if case.get("error") is not None:
+                        item["error"] = str(case["error"])[:1_000]
+                failed_cases.append(item)
+        summary["case_count"] = len(cases)
+        summary["failed_cases"] = failed_cases
+    return json.dumps(summary, ensure_ascii=False, sort_keys=True)
 
 
 def _strategy_filename(strategy_class: ast.ClassDef) -> str:
@@ -301,9 +342,21 @@ class AgentRunner:
         tool_failure_repair_pending = False
         validation = _ValidationState()
         requirements = [*history, ChatTurn("user", message)]
+        logger.info(
+            "agent_turn_started conversation_id=%s model=%s max_tool_rounds=%d",
+            conversation_id or "-",
+            model,
+            self._max_tool_rounds,
+        )
         yield AgentEvent("status", {"phase": "started", "model": model})
 
         for round_index in range(self._max_tool_rounds + 1):
+            logger.info(
+                "agent_model_round_started conversation_id=%s model=%s round=%d",
+                conversation_id or "-",
+                model,
+                round_index + 1,
+            )
             round_content: list[str] = []
             round_reasoning_content: list[str] = []
             calls: list[ToolCall] = []
@@ -325,6 +378,17 @@ class AgentRunner:
                 if chunk.usage:
                     usage = chunk.usage
 
+            logger.info(
+                "agent_model_round_finished conversation_id=%s model=%s round=%d "
+                "response_chars=%d tool_calls=%s usage=%s",
+                conversation_id or "-",
+                model,
+                round_index + 1,
+                len("".join(round_content)),
+                [call.name for call in calls],
+                usage,
+            )
+
             if "".join(round_content).lstrip().startswith("【参数补充请求】"):
                 if created:
                     message = "已保存文件后不能再发出参数补充请求"
@@ -332,6 +396,11 @@ class AgentRunner:
                         message,
                         failure_context=_failure_context(message, tool_failures),
                     )
+                logger.info(
+                    "agent_turn_completed conversation_id=%s model=%s artifacts=0 parameter_request=true",
+                    conversation_id or "-",
+                    model,
+                )
                 yield AgentEvent(
                     "done",
                     {"content": "".join(visible_content), "model": model, "artifacts": [], "usage": usage},
@@ -366,6 +435,12 @@ class AgentRunner:
                         message,
                         failure_context=_failure_context(message, tool_failures),
                     )
+                logger.info(
+                    "agent_turn_completed conversation_id=%s model=%s artifacts=%d",
+                    conversation_id or "-",
+                    model,
+                    len(created),
+                )
                 yield AgentEvent(
                     "done",
                     {
@@ -382,6 +457,16 @@ class AgentRunner:
 
             if round_index >= self._max_tool_rounds:
                 message = f"工具调用超过 {self._max_tool_rounds} 轮上限"
+                logger.error(
+                    "agent_tool_round_limit_reached conversation_id=%s model=%s round=%d "
+                    "max_tool_rounds=%d pending_tools=%s failed_tool_calls=%d",
+                    conversation_id or "-",
+                    model,
+                    round_index + 1,
+                    self._max_tool_rounds,
+                    [call.name for call in calls],
+                    len(tool_failures),
+                )
                 raise AgentError(
                     message,
                     failure_context=_failure_context(message, tool_failures),
@@ -424,11 +509,43 @@ class AgentRunner:
                         f"对工具 {call.name} 使用相同参数再次调用；此前已失败 {failure_count} 次，"
                         "已停止重复调用"
                     )
+                    logger.error(
+                        "agent_repeated_failed_tool_call_stopped conversation_id=%s model=%s "
+                        "round=%d call=%d tool=%s signature_sha256=%s previous_failures=%d",
+                        conversation_id or "-",
+                        model,
+                        round_index + 1,
+                        call_index,
+                        call.name,
+                        _tool_call_signature_digest(call.name, call.arguments),
+                        failure_count,
+                    )
                     raise AgentError(
                         message,
                         failure_context=_failure_context(message, tool_failures),
                     )
 
+                source = call.arguments.get("source")
+                source_summary = ""
+                if isinstance(source, str):
+                    source_summary = (
+                        f" source_sha256={_source_digest_for_log(source)}"
+                        f" source_bytes={len(source.encode('utf-8', errors='replace'))}"
+                    )
+                logger.info(
+                    "agent_tool_started conversation_id=%s model=%s round=%d call=%d/%d "
+                    "tool=%s call_id=%s signature_sha256=%s argument_keys=%s%s",
+                    conversation_id or "-",
+                    model,
+                    round_index + 1,
+                    call_index,
+                    len(resolved_calls),
+                    call.name,
+                    call.call_id,
+                    _tool_call_signature_digest(call.name, call.arguments),
+                    sorted(call.arguments),
+                    source_summary,
+                )
                 yield AgentEvent("status", {"phase": "tool_started", "tool": call.name})
                 try:
                     result, artifact = await self._call_tool(
@@ -441,15 +558,52 @@ class AgentRunner:
                         options=model_options,
                     )
                 except (ValueError, OSError) as exc:
-                    result, artifact = {"error": str(exc)}, None
-                if result.get("error") or result.get("passed") is False:
+                    detail = _exception_detail(exc)
+                    logger.warning(
+                        "agent_tool_raised conversation_id=%s model=%s round=%d call=%d "
+                        "tool=%s exception_type=%s detail=%s",
+                        conversation_id or "-",
+                        model,
+                        round_index + 1,
+                        call_index,
+                        call.name,
+                        type(exc).__name__,
+                        detail[:2_000],
+                    )
+                    result, artifact = {"error": detail}, None
+                if result.get("error") is not None or result.get("passed") is False:
                     tool_failure_repair_pending = True
                     failed_tool_call_counts[signature] = failure_count + 1
+                    logger.warning(
+                        "agent_tool_failed conversation_id=%s model=%s round=%d call=%d/%d "
+                        "tool=%s signature_sha256=%s%s result=%s",
+                        conversation_id or "-",
+                        model,
+                        round_index + 1,
+                        call_index,
+                        len(resolved_calls),
+                        call.name,
+                        _tool_call_signature_digest(call.name, call.arguments),
+                        source_summary,
+                        _tool_result_log_summary(result),
+                    )
                     tool_failures.append(
                         f"第 {round_index + 1} 轮第 {call_index}/{len(calls)} 个工具调用，"
                         f"{call.name}: {json.dumps(result, ensure_ascii=False)}"
                     )
                 else:
+                    logger.info(
+                        "agent_tool_succeeded conversation_id=%s model=%s round=%d call=%d/%d "
+                        "tool=%s signature_sha256=%s result_keys=%s",
+                        conversation_id or "-",
+                        model,
+                        round_index + 1,
+                        call_index,
+                        len(resolved_calls),
+                        call.name,
+                        _tool_call_signature_digest(call.name, call.arguments),
+                        sorted(result),
+                    )
                     failed_tool_call_counts.pop(signature, None)
                     if call.name == "run_functional_test" and result.get("passed") is True:
                         write_signature = _tool_call_signature(
@@ -475,6 +629,14 @@ class AgentRunner:
                 messages.append(UserMessage(TOOL_FAILURE_REPAIR_PROMPT))
 
         message = "Agent 未能完成请求"
+        logger.error(
+            "agent_loop_exhausted conversation_id=%s model=%s max_tool_rounds=%d "
+            "failed_tool_calls=%d",
+            conversation_id or "-",
+            model,
+            self._max_tool_rounds,
+            len(tool_failures),
+        )
         raise AgentError(
             message,
             failure_context=_failure_context(message, tool_failures),
@@ -566,7 +728,18 @@ class AgentRunner:
                 raise
             except Exception as exc:
                 validation.functional_passed.discard(digest)
-                raise ValueError(f"功能检测失败：{exc}") from exc
+                detail = _exception_detail(exc)
+                logger.exception(
+                    "agent_functional_test_exception conversation_id=%s model=%s "
+                    "source_sha256=%s source_bytes=%d exception_type=%s detail=%s",
+                    conversation_id or "-",
+                    model,
+                    digest,
+                    len(source.encode("utf-8", errors="replace")),
+                    type(exc).__name__,
+                    detail[:2_000],
+                )
+                raise ValueError(f"功能检测失败：{detail}") from exc
             if not isinstance(result, dict):
                 validation.functional_passed.discard(digest)
                 raise ValueError("功能检测服务返回了无效结果")
