@@ -26,6 +26,12 @@ import type {
   Page,
 } from './types';
 
+const QWEN38_MAX_CONTEXT_TOKENS = 262_144;
+
+function isQwen38Model(model: string): boolean {
+  return model.toLowerCase().startsWith('qwen3.8');
+}
+
 function createUuid(): string {
   const cryptoApi = globalThis.crypto;
   if (typeof cryptoApi.randomUUID === 'function') {
@@ -455,6 +461,7 @@ export default function App() {
   const [artifactBusy, setArtifactBusy] = useState('');
   const abortRef = useRef<AbortController | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
+  const selectedModelUsesQwen38Context = provider === 'ollama' && isQwen38Model(model);
 
   function commitMessages(next: ChatMessage[]) {
     messagesRef.current = next;
@@ -816,16 +823,16 @@ export default function App() {
                     <span>启用思考模式</span>
                   </label>
                   {provider === 'ollama' && <label>
-                    <span>上下文长度</span>
+                    <span>{selectedModelUsesQwen38Context ? '上下文长度（Qwen3.8 固定）' : '上下文长度'}</span>
                     <input
                       aria-label="上下文长度"
                       type="number"
                       min={512}
-                      max={131_072}
+                      max={selectedModelUsesQwen38Context ? QWEN38_MAX_CONTEXT_TOKENS : 131_072}
                       step={512}
-                      value={modelOptions.num_ctx}
+                      value={selectedModelUsesQwen38Context ? QWEN38_MAX_CONTEXT_TOKENS : modelOptions.num_ctx}
                       onChange={(event) => updateModelOption('num_ctx', event.target.value)}
-                      disabled={busy}
+                      disabled={busy || selectedModelUsesQwen38Context}
                     />
                   </label>}
                   <label>

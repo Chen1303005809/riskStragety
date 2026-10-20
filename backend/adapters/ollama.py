@@ -22,6 +22,9 @@ from agent.contracts import (
 from backend.adapters.provider_messages import ProviderWireMessage
 
 
+QWEN38_MAX_CONTEXT_TOKENS = 262_144
+
+
 @dataclass(frozen=True)
 class OllamaWireMessage(ProviderWireMessage):
     role: str
@@ -86,12 +89,16 @@ class OllamaModelGateway(ModelGateway):
         options: dict[str, int | float],
         think: bool,
     ) -> AsyncIterator[ModelChunk]:
+        model_options = dict(options)
+        if model.casefold().startswith("qwen3.8"):
+            model_options["num_ctx"] = QWEN38_MAX_CONTEXT_TOKENS
+
         stream = await self._client.chat(
             model=model,
             messages=_ollama_messages(messages),
             tools=tools,
             stream=True,
-            options=options,
+            options=model_options,
             think=think,
         )
         async for item in stream:

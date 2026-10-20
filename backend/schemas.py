@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_
 class ModelOptions(BaseModel):
     temperature: float = Field(default=0.3, ge=0, le=2, allow_inf_nan=False)
     top_p: float = Field(default=0.8, ge=0, le=1, allow_inf_nan=False)
-    num_ctx: int = Field(default=16_384, ge=512, le=131_072, strict=True)
+    num_ctx: int = Field(default=16_384, ge=512, le=262_144, strict=True)
 
     @field_validator("temperature", "top_p", mode="before")
     @classmethod

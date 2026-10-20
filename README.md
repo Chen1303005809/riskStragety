@@ -55,7 +55,7 @@ curl -N http://127.0.0.1:8765/api/agent/chat/stream \
   -d '{"account_id":"demo-account","conversation_id":"550e8400-e29b-41d4-a716-446655440000","message":"SHFE rb2710 超过 3900 时预警","model":"qwen3:8b","options":{"temperature":0.3,"top_p":0.8,"num_ctx":16384},"think":false}'
 ```
 
-`options.temperature` 范围为 `0–2`，`options.top_p` 范围为 `0–1`，`options.num_ctx` 范围为 `512–131072` 的整数。省略 `options` 或 `think` 时分别使用 `0.3`、`0.8`、`16384` 和 `false`。
+`options.temperature` 范围为 `0–2`，`options.top_p` 范围为 `0–1`，`options.num_ctx` 范围为 `512–262144` 的整数。省略 `options` 或 `think` 时分别使用 `0.3`、`0.8`、`16384` 和 `false`。选择 Ollama 的 Qwen3.8 模型时，服务端会忽略请求传入的 `num_ctx` 并固定为 `262144`；网页也会显示该固定值。
 
 `POST /api/agent/chat/stream` 返回 `text/event-stream`：
 
