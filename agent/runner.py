@@ -29,6 +29,7 @@ from agent.prompt import build_system_prompt
 
 
 MAX_TOOL_ROUNDS = 12
+MAX_IDENTICAL_FAILED_TOOL_CALLS = 2
 TOOL_FAILURE_REPAIR_PROMPT = (
     "上一个工具结果包含 error 或 passed=false。请先检查该工具结果中的具体诊断，"
     "直接通过工具修正候选策略；功能检测失败时，先重新调用 check_python_syntax，"
@@ -139,6 +140,16 @@ class _ValidationState:
 
 def _source_digest(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _tool_call_signature(call: ToolCall) -> str:
+    """Return a stable signature for detecting an unchanged failed tool call."""
+    return json.dumps(
+        {"name": call.name, "arguments": call.arguments},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _strategy_filename(strategy_class: ast.ClassDef) -> str:
@@ -274,6 +285,7 @@ class AgentRunner:
         visible_content: list[str] = []
         created: list[Artifact] = []
         tool_failures: list[str] = []
+        failed_tool_call_counts: dict[str, int] = {}
         tool_failure_repair_pending = False
         validation = _ValidationState()
         requirements = [*history, ChatTurn("user", message)]
@@ -374,6 +386,18 @@ class AgentRunner:
             messages.append(assistant_message)
             tool_failure_repair_pending = False
             for call in calls:
+                signature = _tool_call_signature(call)
+                failure_count = failed_tool_call_counts.get(signature, 0)
+                if failure_count >= MAX_IDENTICAL_FAILED_TOOL_CALLS:
+                    message = (
+                        f"工具 {call.name} 使用相同参数已失败 {failure_count} 次，"
+                        "已停止重复调用"
+                    )
+                    raise AgentError(
+                        message,
+                        failure_context=_failure_context(message, tool_failures),
+                    )
+
                 yield AgentEvent("status", {"phase": "tool_started", "tool": call.name})
                 try:
                     result, artifact = await self._call_tool(
@@ -389,9 +413,12 @@ class AgentRunner:
                     result, artifact = {"error": str(exc)}, None
                 if result.get("error") or result.get("passed") is False:
                     tool_failure_repair_pending = True
+                    failed_tool_call_counts[signature] = failure_count + 1
                     tool_failures.append(
                         f"{call.name}: {json.dumps(result, ensure_ascii=False)}"
                     )
+                else:
+                    failed_tool_call_counts.pop(signature, None)
                 if artifact:
                     created.append(artifact)
                     yield AgentEvent(
