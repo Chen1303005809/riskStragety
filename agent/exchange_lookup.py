@@ -51,6 +51,18 @@ EXCHANGE_NAMES = {
     "GFEX": "广州期货交易所",
 }
 
+# 少量常见简称只用于把用户口语映射到唯一品种；不做模糊匹配，避免把相近品种猜成同一品种。
+PRODUCT_ALIASES = {
+    "螺纹": "螺纹钢",
+    "热卷": "热轧卷板",
+    "豆一": "黄大豆1号",
+    "豆二": "黄大豆2号",
+    "沪深300": "沪深300股指",
+    "上证50": "上证50股指",
+    "中证500": "中证500股指",
+    "中证1000": "中证1000股指",
+}
+
 _PRODUCT_CODES = sorted(
     ((product_code.upper(), exchange, product_code, product_name)
      for exchange, products in EXCHANGE_PRODUCTS.items()
@@ -162,3 +174,137 @@ def lookup_exchange_by_contract_code(
         "message": f"已识别为{EXCHANGE_NAMES[exchange]}的{product_name}期货，交割月为 {delivery_month}。",
     })
     return base
+
+
+def resolve_contract_by_product_month(
+    product: str,
+    month: int,
+    *,
+    year: int | None = None,
+    exchange_code: str | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Resolve an unambiguous product and delivery month to a verified contract code."""
+    current = _current_shanghai_time(now)
+    normalized_product = "".join(product.casefold().split()) if isinstance(product, str) else ""
+    base: dict[str, Any] = {
+        "contract_code": None,
+        "canonical_contract_code": None,
+        "product_code": None,
+        "product_name": None,
+        "exchange_code": None,
+        "exchange_name": None,
+        "delivery_month": None,
+        "current_month": current.strftime("%Y-%m"),
+        "status": "unrecognized",
+        "is_valid": False,
+        "message": "未识别该期货品种，无法生成候选合约代码。",
+        "requested_product": product,
+        "requested_month": month,
+        "requested_year": year,
+        "year_inferred": year is None,
+    }
+    if not normalized_product:
+        return base
+    if isinstance(month, bool) or not isinstance(month, int) or not 1 <= month <= 12:
+        base.update({
+            "status": "invalid_month",
+            "message": "交割月份必须是 1 到 12 的整数。",
+        })
+        return base
+    if year is not None and (
+        isinstance(year, bool) or not isinstance(year, int) or not 2000 <= year <= 2099
+    ):
+        base.update({
+            "status": "invalid_year",
+            "message": "交割年份必须是 2000 到 2099 之间的整数。",
+        })
+        return base
+
+    alias_target = PRODUCT_ALIASES.get(normalized_product)
+    normalized_name = "".join(alias_target.casefold().split()) if alias_target else normalized_product
+    normalized_exchange = exchange_code.strip().upper() if isinstance(exchange_code, str) else None
+    all_matches: list[tuple[str, str, str]] = []
+    for candidate_exchange, products in EXCHANGE_PRODUCTS.items():
+        for product_code, product_name in products.items():
+            if (
+                normalized_name == "".join(product_name.casefold().split())
+                or normalized_product == product_code.casefold()
+            ):
+                all_matches.append((candidate_exchange, product_code, product_name))
+
+    if not all_matches:
+        if normalized_exchange and normalized_exchange not in EXCHANGE_PRODUCTS:
+            base.update({
+                "status": "invalid_exchange",
+                "message": "交易所代码无效，无法解析该品种。",
+            })
+        return base
+    matches = all_matches
+    if normalized_exchange:
+        if normalized_exchange not in EXCHANGE_PRODUCTS:
+            base.update({
+                "status": "invalid_exchange",
+                "message": "交易所代码无效，无法解析该品种。",
+            })
+            return base
+        matches = [item for item in all_matches if item[0] == normalized_exchange]
+        if not matches:
+            base.update({
+                "status": "exchange_mismatch",
+                "candidates": [
+                    {
+                        "product_code": code,
+                        "product_name": name,
+                        "exchange_code": exchange,
+                        "exchange_name": EXCHANGE_NAMES[exchange],
+                    }
+                    for exchange, code, name in all_matches
+                ],
+                "message": "用户指定的交易所与该品种所属交易所不匹配。",
+            })
+            return base
+    if len(matches) > 1:
+        base.update({
+            "status": "ambiguous_product",
+            "candidates": [
+                {
+                    "product_code": code,
+                    "product_name": name,
+                    "exchange_code": exchange,
+                    "exchange_name": EXCHANGE_NAMES[exchange],
+                }
+                for exchange, code, name in matches
+            ],
+            "message": "该品种名称对应多个交易所，请补充交易所。",
+        })
+        return base
+
+    selected_exchange, product_code, product_name = matches[0]
+    resolved_year = year
+    if resolved_year is None:
+        resolved_year = current.year if month >= current.month else current.year + 1
+    suffix = (
+        f"{resolved_year % 10}{month:02d}"
+        if selected_exchange == "CZCE"
+        else f"{resolved_year % 100:02d}{month:02d}"
+    )
+    result = lookup_exchange_by_contract_code(f"{product_code}{suffix}", now=now)
+    requested_delivery_month = f"{resolved_year:04d}-{month:02d}"
+    if (
+        selected_exchange == "CZCE"
+        and result.get("delivery_month") != requested_delivery_month
+    ):
+        result.update({
+            "status": "ambiguous_year",
+            "is_valid": False,
+            "message": "郑州商品交易所合约代码只包含一位年份，无法唯一表示该交割年份。",
+        })
+    result.update({
+        "requested_product": product,
+        "requested_month": month,
+        "requested_year": year,
+        "year_inferred": year is None,
+        "resolved_year": resolved_year,
+    })
+    return result

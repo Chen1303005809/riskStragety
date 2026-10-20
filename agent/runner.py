@@ -21,7 +21,10 @@ from agent.contracts import (
     ModelGateway,
     ToolCall,
 )
-from agent.exchange_lookup import lookup_exchange_by_contract_code
+from agent.exchange_lookup import (
+    lookup_exchange_by_contract_code,
+    resolve_contract_by_product_month,
+)
 from agent.prompt import build_system_prompt
 
 
@@ -36,13 +39,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "lookup_exchange_by_contract_code",
-            "description": "离线查询境内六家期货交易所的期货合约代码，返回品种、交易所和交割月状态。既可查询用户明确提供的代码，也可查询从可识别的品种名称与交割月份推导出的候选代码；canonical_contract_code 保留映射表大小写，是生成源码时唯一可用的合约代码，contract_code 仅供识别且统一大写。不支持期权。",
+            "description": "离线识别境内六家期货交易所的期货合约。用户给出合约代码时传 contract_code；用户给出品种名称和交割月份时传 product_name 与 month，并可传 year、exchange_code，让工具直接推导并核验标准代码。CZCE 合约后缀为三位数字（一位年份加两位月份），其他交易所为四位数字。唯一匹配且状态为 matched 时无需向用户确认。canonical_contract_code 保留映射表大小写，是生成源码时唯一可用的合约代码；contract_code 仅供识别且统一大写。不支持期权。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "contract_code": {"type": "string", "description": "用户明确给出或根据品种名称和交割月份推导出的境内期货合约代码，例如 rb2710"},
+                    "contract_code": {"type": "string", "description": "用户明确给出的境内期货合约代码，例如 rb2710"},
+                    "product_name": {"type": "string", "description": "用户给出的期货品种名称或代码，例如 豆粕、螺纹钢、m"},
+                    "month": {"type": "integer", "minimum": 1, "maximum": 12, "description": "交割月份；将‘七月’等自然语言月份转为 7"},
+                    "year": {"type": "integer", "minimum": 2000, "maximum": 2099, "description": "用户明确给出的交割年份；未明确时省略，由工具按上海当前日期推导"},
+                    "exchange_code": {"type": "string", "enum": ["SHFE", "INE", "DCE", "CZCE", "CFFEX", "GFEX"], "description": "用户明确给出的交易所代码；未明确时省略"},
                 },
-                "required": ["contract_code"],
             },
         },
     },
@@ -414,9 +420,27 @@ class AgentRunner:
         args = call.arguments
         if call.name == "lookup_exchange_by_contract_code":
             contract_code = args.get("contract_code")
-            if not isinstance(contract_code, str):
-                raise ValueError("contract_code 必须是字符串")
-            result = lookup_exchange_by_contract_code(contract_code)
+            if isinstance(contract_code, str) and contract_code.strip():
+                result = lookup_exchange_by_contract_code(contract_code)
+            else:
+                product_name = args.get("product_name")
+                month = args.get("month")
+                if not isinstance(product_name, str):
+                    raise ValueError("请提供 contract_code，或同时提供 product_name 与 month")
+                if isinstance(month, bool) or not isinstance(month, int):
+                    raise ValueError("品种和交割月份查询必须提供整数 month")
+                year = args.get("year")
+                exchange_code = args.get("exchange_code")
+                if year is not None and (isinstance(year, bool) or not isinstance(year, int)):
+                    raise ValueError("year 必须是整数")
+                if exchange_code is not None and not isinstance(exchange_code, str):
+                    raise ValueError("exchange_code 必须是字符串")
+                result = resolve_contract_by_product_month(
+                    product_name,
+                    month,
+                    year=year,
+                    exchange_code=exchange_code,
+                )
             normalized_code = result.get("contract_code")
             canonical_code = result.get("canonical_contract_code")
             if isinstance(normalized_code, str) and isinstance(canonical_code, str):
