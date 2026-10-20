@@ -15,11 +15,17 @@ from agent.contracts import (
     AgentEvent,
     Artifact,
     ArtifactWriter,
+    AssistantMessage,
+    AssistantToolCall,
     ChatTurn,
     FunctionalTester,
     InterfaceReader,
     ModelGateway,
+    ModelMessage,
+    SystemMessage,
     ToolCall,
+    ToolResultMessage,
+    UserMessage,
 )
 from agent.exchange_lookup import (
     lookup_exchange_by_contract_code,
@@ -143,10 +149,10 @@ def _source_digest(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
-def _tool_call_signature(call: ToolCall) -> str:
+def _tool_call_signature(name: str, arguments: dict[str, Any]) -> str:
     """Return a stable signature for detecting an unchanged failed tool call."""
     return json.dumps(
-        {"name": call.name, "arguments": call.arguments},
+        {"name": name, "arguments": arguments},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -279,14 +285,19 @@ class AgentRunner:
         conversation_turns = _coalesce_adjacent_turns(
             [*history, ChatTurn("user", message)]
         )
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": build_system_prompt()},
-            *({"role": turn.role, "content": turn.content} for turn in conversation_turns),
-        ]
+        messages: list[ModelMessage] = [SystemMessage(build_system_prompt())]
+        messages.extend(
+            UserMessage(turn.content)
+            if turn.role == "user"
+            else AssistantMessage(turn.content)
+            for turn in conversation_turns
+        )
         visible_content: list[str] = []
         created: list[Artifact] = []
         tool_failures: list[str] = []
         failed_tool_call_counts: dict[str, int] = {}
+        used_call_ids: set[str] = set()
+        generated_call_id = 0
         tool_failure_repair_pending = False
         validation = _ValidationState()
         requirements = [*history, ChatTurn("user", message)]
@@ -331,11 +342,13 @@ class AgentRunner:
                 if tool_failure_repair_pending:
                     assistant_content = "".join(round_content)
                     if assistant_content.strip() or round_reasoning_content:
-                        assistant_message = {"role": "assistant", "content": assistant_content}
-                        if round_reasoning_content:
-                            assistant_message["reasoning_content"] = "".join(round_reasoning_content)
-                        messages.append(assistant_message)
-                    messages.append({"role": "user", "content": TOOL_FAILURE_REPAIR_PROMPT})
+                        messages.append(
+                            AssistantMessage(
+                                assistant_content,
+                                reasoning_content="".join(round_reasoning_content),
+                            )
+                        )
+                    messages.append(UserMessage(TOOL_FAILURE_REPAIR_PROMPT))
                     tool_failure_repair_pending = False
                     continue
                 content = "".join(visible_content)
@@ -374,20 +387,36 @@ class AgentRunner:
                     failure_context=_failure_context(message, tool_failures),
                 )
 
-            assistant_message = {
-                "role": "assistant",
-                "content": "".join(round_content),
-                "tool_calls": [
-                    {"function": {"name": call.name, "arguments": call.arguments}}
-                    for call in calls
-                ],
+            reserved_provider_call_ids = {
+                call.call_id for call in calls if call.call_id
             }
-            if round_reasoning_content:
-                assistant_message["reasoning_content"] = "".join(round_reasoning_content)
-            messages.append(assistant_message)
+            resolved_calls: list[AssistantToolCall] = []
+            for call in calls:
+                call_id = call.call_id
+                if not call_id or call_id in used_call_ids:
+                    while True:
+                        call_id = f"agent_call_{generated_call_id}"
+                        generated_call_id += 1
+                        if (
+                            call_id not in used_call_ids
+                            and call_id not in reserved_provider_call_ids
+                        ):
+                            break
+                used_call_ids.add(call_id)
+                resolved_calls.append(
+                    AssistantToolCall(call_id, call.name, call.arguments)
+                )
+
+            messages.append(
+                AssistantMessage(
+                    content="".join(round_content),
+                    tool_calls=tuple(resolved_calls),
+                    reasoning_content="".join(round_reasoning_content),
+                )
+            )
             tool_failure_repair_pending = False
-            for call_index, call in enumerate(calls, start=1):
-                signature = _tool_call_signature(call)
+            for call_index, call in enumerate(resolved_calls, start=1):
+                signature = _tool_call_signature(call.name, call.arguments)
                 failure_count = failed_tool_call_counts.get(signature, 0)
                 if failure_count >= MAX_IDENTICAL_FAILED_TOOL_CALLS:
                     message = (
@@ -422,6 +451,11 @@ class AgentRunner:
                     )
                 else:
                     failed_tool_call_counts.pop(signature, None)
+                    if call.name == "run_functional_test" and result.get("passed") is True:
+                        write_signature = _tool_call_signature(
+                            "write_generated_file", call.arguments
+                        )
+                        failed_tool_call_counts.pop(write_signature, None)
                 if artifact:
                     created.append(artifact)
                     yield AgentEvent(
@@ -429,16 +463,16 @@ class AgentRunner:
                         {"artifact_id": artifact.artifact_id, "filename": artifact.filename},
                     )
                 messages.append(
-                    {
-                        "role": "tool",
-                        "tool_name": call.name,
-                        "content": json.dumps(result, ensure_ascii=False),
-                    }
+                    ToolResultMessage(
+                        content=json.dumps(result, ensure_ascii=False),
+                        call_id=call.call_id,
+                        tool_name=call.name,
+                    )
                 )
                 yield AgentEvent("status", {"phase": "tool_finished", "tool": call.name})
 
             if tool_failure_repair_pending:
-                messages.append({"role": "user", "content": TOOL_FAILURE_REPAIR_PROMPT})
+                messages.append(UserMessage(TOOL_FAILURE_REPAIR_PROMPT))
 
         message = "Agent 未能完成请求"
         raise AgentError(
@@ -448,7 +482,7 @@ class AgentRunner:
 
     async def _call_tool(
         self,
-        call: ToolCall,
+        call: AssistantToolCall,
         account_id: str,
         conversation_id: str | None,
         *,

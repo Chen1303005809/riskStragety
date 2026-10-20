@@ -11,7 +11,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
-from agent.contracts import ChatTurn, ModelChunk, ToolCall
+from agent.contracts import AgentMessage, ChatTurn, ModelChunk, ModelGateway, ToolCall
 from backend.app import ARTIFACT_STREAM_CHUNK_SIZE, _artifact_chunks, create_app
 from backend.config import Settings
 
@@ -24,7 +24,11 @@ CHAT_CONTEXT = {
 }
 
 
-class WorkingModel:
+def strategy_source(name: str = "Strategy") -> str:
+    return f"class My_PythonObj(RHTemplate):\n    name = {name!r}\n    pass\n"
+
+
+class WorkingModel(ModelGateway):
     def __init__(self) -> None:
         self.settings_seen: list[tuple[dict[str, int | float], bool]] = []
         self.rounds = 0
@@ -35,14 +39,14 @@ class WorkingModel:
     async def stream_chat(
         self,
         model: str,
-        messages: list[dict[str, Any]],
+        messages: list[AgentMessage],
         tools: list[dict[str, Any]],
         *,
         options: dict[str, int | float],
         think: bool,
     ) -> AsyncIterator[ModelChunk]:
         self.settings_seen.append((options.copy(), think))
-        source = "class Strategy(RHTemplate):\n    pass\n"
+        source = strategy_source()
         calls = [
             ToolCall("check_python_syntax", {"source": source}),
             ToolCall("run_functional_test", {"source": source}),
@@ -93,7 +97,9 @@ def test_authentication_and_model_list(tmp_path: Path) -> None:
     assert client.get("/api/models").status_code == 401
     assert client.get("/api/models", headers={"Authorization": "Bearer wrong"}).status_code == 401
     assert client.get("/api/models", headers=AUTH).json() == {
-        "models": ["model-a", "model-b"], "default_model": "model-a"
+        "models": ["model-a", "model-b"],
+        "default_model": "model-a",
+        "deepseek_configured": False,
     }
     assert client.post("/api/agent/chat/stream", json={"message": "hello"}).status_code == 401
 
@@ -133,7 +139,7 @@ def test_chat_sse_and_artifact_download(tmp_path: Path) -> None:
         "artifact_id": artifact["artifact_id"], "account_id": "test-account"
     })
     assert download.status_code == 200
-    assert download.content == b"class Strategy(RHTemplate):\n    pass\n"
+    assert download.content == strategy_source().encode()
     assert download.headers["content-type"] == "application/octet-stream"
     assert "content-length" not in download.headers
     assert "filename*=UTF-8''" in download.headers["content-disposition"]
@@ -141,26 +147,26 @@ def test_chat_sse_and_artifact_download(tmp_path: Path) -> None:
 
 
 def test_followup_after_failed_tool_keeps_valid_model_turns(tmp_path: Path) -> None:
-    class FollowupModel:
+    class FollowupModel(ModelGateway):
         def __init__(self) -> None:
             self.role_sequences: list[list[str]] = []
-            self.messages_seen: list[list[dict[str, Any]]] = []
+            self.messages_seen: list[list[AgentMessage]] = []
 
         async def list_models(self) -> list[str]:
             return ["model-a"]
 
         async def stream_chat(self, model, messages, tools, *, options, think):
-            roles = [item["role"] for item in messages]
-            users = [item["content"] for item in messages if item["role"] == "user"]
+            roles = [item.role for item in messages]
+            users = [item.content for item in messages if item.role == "user"]
             self.role_sequences.append(roles)
-            self.messages_seen.append([item.copy() for item in messages])
+            self.messages_seen.append(list(messages))
             if any(
-                item["role"] == "assistant" and "【上轮失败诊断】" in item["content"]
+                item.role == "assistant" and "【上轮失败诊断】" in item.content
                 for item in messages
             ):
                 yield ModelChunk(content="【参数补充请求】请提供触发阈值。")
             elif "初次尝试" in users[-1] and not any(
-                item["role"] == "tool" for item in messages
+                item.role == "tool" for item in messages
             ):
                 yield ModelChunk(tool_calls=(ToolCall(
                     "write_generated_file",
@@ -188,13 +194,13 @@ def test_followup_after_failed_tool_keeps_valid_model_turns(tmp_path: Path) -> N
     assert "参数补充请求" in second_events[-1][1]["content"]
     assert model.role_sequences[-1] == ["system", "user", "assistant", "user"]
     assert [
-        item["content"] for item in model.messages_seen[-1] if item["role"] == "user"
+        item.content for item in model.messages_seen[-1] if item.role == "user"
     ] == ["初次尝试生成策略", "补充说明：请继续处理"]
     failure_turn = model.messages_seen[-1][-2]
-    assert failure_turn["role"] == "assistant"
-    assert "【上轮失败诊断】" in failure_turn["content"]
-    assert "保存前必须先通过同一份源码的 check_python_syntax" in failure_turn["content"]
-    assert model.messages_seen[-1][-1]["content"] == "补充说明：请继续处理"
+    assert failure_turn.role == "assistant"
+    assert "【上轮失败诊断】" in failure_turn.content
+    assert "保存前必须先通过同一份源码的 check_python_syntax" in failure_turn.content
+    assert model.messages_seen[-1][-1].content == "补充说明：请继续处理"
 
 
 def test_artifact_chunker_sends_bounded_binary_chunks() -> None:
@@ -226,7 +232,7 @@ def test_download_rejects_bad_id_missing_file_and_other_owner(tmp_path: Path) ->
 
 
 def test_model_unavailable_and_stream_failure_are_reported(tmp_path: Path) -> None:
-    class BrokenModel:
+    class BrokenModel(ModelGateway):
         async def list_models(self):
             raise ConnectionError("offline")
 
@@ -260,7 +266,7 @@ def test_request_schema_rejects_invalid_history(tmp_path: Path) -> None:
 
 
 def test_chat_accepts_custom_model_options_and_think(tmp_path: Path) -> None:
-    class CapturingModel:
+    class CapturingModel(ModelGateway):
         def __init__(self) -> None:
             self.settings_seen: list[tuple[dict[str, int | float], bool]] = []
 
@@ -308,7 +314,7 @@ def test_chat_rejects_invalid_model_options_and_think(tmp_path: Path) -> None:
 
 
 def test_concurrent_sse_requests_have_distinct_history_and_artifacts(tmp_path: Path) -> None:
-    class ParallelModel:
+    class ParallelModel(ModelGateway):
         def __init__(self) -> None:
             self.rounds: dict[str, int] = {}
 
@@ -316,11 +322,11 @@ def test_concurrent_sse_requests_have_distinct_history_and_artifacts(tmp_path: P
             return ["model-a"]
 
         async def stream_chat(self, model, messages, tools, *, options, think):
-            user = next(item["content"] for item in reversed(messages) if item["role"] == "user")
+            user = next(item.content for item in reversed(messages) if item.role == "user")
             await asyncio.sleep(0.001)
             index = self.rounds.get(user, 0)
             self.rounds[user] = index + 1
-            source = f"class {user.upper()}Strategy(RHTemplate):\n    pass\n"
+            source = strategy_source(f"{user.upper()}Strategy")
             calls = [
                 ToolCall("check_python_syntax", {"source": source}),
                 ToolCall("run_functional_test", {"source": source}),
@@ -364,5 +370,5 @@ def test_concurrent_sse_requests_have_distinct_history_and_artifacts(tmp_path: P
     first_id = first_done["artifacts"][0]["artifact_id"]
     second_id = second_done["artifacts"][0]["artifact_id"]
     assert first_id != second_id
-    assert (tmp_path / "artifacts" / f"{first_id}.py").read_text() == "class AStrategy(RHTemplate):\n    pass\n"
-    assert (tmp_path / "artifacts" / f"{second_id}.py").read_text() == "class BStrategy(RHTemplate):\n    pass\n"
+    assert (tmp_path / "artifacts" / f"{first_id}.py").read_text() == strategy_source("AStrategy")
+    assert (tmp_path / "artifacts" / f"{second_id}.py").read_text() == strategy_source("BStrategy")

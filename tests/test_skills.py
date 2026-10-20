@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from agent.contracts import ChatTurn, ModelChunk, ToolCall
+from agent.contracts import ChatTurn, ModelChunk, ModelGateway, ToolCall
 from agent.functional_tests import (
     FunctionalTestCase,
     FunctionalTestError,
@@ -30,7 +30,7 @@ class MemorySkillLoader:
         return Skill(skill_id, self.instructions)
 
 
-class CaseModel:
+class CaseModel(ModelGateway):
     def __init__(self, arguments: dict[str, Any]) -> None:
         self.arguments = arguments
         self.seen: list[dict[str, Any]] = []
@@ -146,9 +146,9 @@ def test_case_builder_uses_skill_and_separate_structured_model_request() -> None
     )
 
     request = model.seen[0]
-    user_payload = json.loads(request["messages"][1]["content"])
+    user_payload = json.loads(request["messages"][1].content)
     assert skill_loader.loaded == ["test_case_builder"]
-    assert request["messages"][0]["content"] == "construct tests from requirements"
+    assert request["messages"][0].content == "construct tests from requirements"
     assert user_payload["candidate_source"] == source
     assert user_payload["conversation"][-1]["content"] == "补充：只提醒一次"
     assert request["model"] == "model-a"

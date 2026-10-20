@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from agent.contracts import ChatTurn, ModelGateway, ToolCall
+from agent.contracts import ChatTurn, ModelGateway, SystemMessage, ToolCall, UserMessage
 from agent.skills import SkillLoader
 
 
@@ -114,8 +114,8 @@ class SkillTestCaseBuilder:
             "candidate_source": source,
         }
         messages = [
-            {"role": "system", "content": skill.instructions},
-            {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
+            SystemMessage(skill.instructions),
+            UserMessage(json.dumps(request, ensure_ascii=False)),
         ]
         model_options = {
             "temperature": 0.0,

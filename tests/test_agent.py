@@ -10,7 +10,16 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from agent.contracts import Artifact, ChatTurn, ModelChunk, ToolCall
+from agent.contracts import (
+    AgentMessage,
+    Artifact,
+    AssistantMessage,
+    ChatTurn,
+    ModelChunk,
+    ModelGateway,
+    ToolCall,
+    ToolResultMessage,
+)
 from agent.prompt import PROMPT_FILE, build_system_prompt
 from agent.runner import AgentError, AgentRunner, check_python_syntax
 
@@ -53,10 +62,10 @@ class PassingFunctionalTester:
         }
 
 
-class ScriptedModel:
+class ScriptedModel(ModelGateway):
     def __init__(self, rounds: list[list[ModelChunk]]) -> None:
         self.rounds = rounds
-        self.seen: list[list[dict[str, Any]]] = []
+        self.seen: list[list[AgentMessage]] = []
         self.settings_seen: list[tuple[dict[str, int | float], bool]] = []
 
     async def list_models(self) -> list[str]:
@@ -80,6 +89,10 @@ def collect(runner: AgentRunner, **kwargs):
     return asyncio.run(read())
 
 
+def _strategy_source(name: str = "RiskStrategy", body: str = "    pass\n") -> str:
+    return f"class My_PythonObj(RHTemplate):\n    name = {name!r}\n{body}"
+
+
 def test_current_time_is_a_volatile_suffix_after_the_stable_prompt() -> None:
     original = PROMPT_FILE.read_text(encoding="utf-8").removesuffix("\n")
     first = build_system_prompt(
@@ -101,14 +114,14 @@ def test_current_time_is_a_volatile_suffix_after_the_stable_prompt() -> None:
     assert "run_functional_test" in stable_first
     assert "write_generated_file" in stable_first
     assert "lookup_exchange_by_contract_code" in stable_first
-    assert "不再询问交易所" in stable_first
+    assert "不要再要求用户提供合约代码" in stable_first
 
 
 def test_exchange_lookup_success_flows_into_strategy_generation_without_exchange_question() -> None:
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     next_month = (now.replace(day=1) + timedelta(days=32)).replace(day=1)
     contract_code = f"rb{next_month.strftime('%y%m')}"
-    source = "class RiskStrategy(RHTemplate):\n    pass\n"
+    source = _strategy_source()
     model = ScriptedModel(
         [
             [ModelChunk(tool_calls=(ToolCall(
@@ -130,7 +143,7 @@ def test_exchange_lookup_success_flows_into_strategy_generation_without_exchange
         history=[], model="model-a", account_id="alice",
     )
 
-    lookup_result = model.seen[1][-1]["content"]
+    lookup_result = model.seen[1][-1].content
     assert '"exchange_code": "SHFE"' in lookup_result
     assert '"status": "matched"' in lookup_result
     assert artifacts.created == [("RiskStrategy.py", source, "alice")]
@@ -157,7 +170,7 @@ def test_unrecognized_contract_asks_only_for_exchange() -> None:
         history=[], model="model-a", account_id="alice",
     )
 
-    assert f'"status": "{expected_status}"' in model.seen[1][-1]["content"]
+    assert f'"status": "{expected_status}"' in model.seen[1][-1].content
     assert events[-1].kind == "done"
     assert expected_followup in events[-1].data["content"]
 
@@ -181,13 +194,13 @@ def test_expired_contract_asks_for_a_valid_contract_code() -> None:
         history=[], model="model-a", account_id="alice",
     )
 
-    assert '"status": "expired"' in model.seen[1][-1]["content"]
+    assert '"status": "expired"' in model.seen[1][-1].content
     assert events[-1].kind == "done"
     assert "提供有效合约代码" in events[-1].data["content"]
 
 
 def test_read_write_reply_flow() -> None:
-    source = "class RiskStrategy(RHTemplate):\n    pass\n"
+    source = _strategy_source()
     model = ScriptedModel(
         [
             [ModelChunk(tool_calls=(ToolCall("list_interface_files", {}),))],
@@ -222,17 +235,60 @@ def test_read_write_reply_flow() -> None:
     assert events[-1].data["artifacts"] == [
         {"artifact_id": "00000000000000000000000000000001", "filename": "RiskStrategy.py"}
     ]
-    assert model.seen[1][-1]["role"] == "tool"
-    assert "external_head.py" in model.seen[1][-1]["content"]
-    assert model.seen[3][-1]["role"] == "tool"
-    assert '"passed": true' in model.seen[3][-1]["content"]
-    assert model.seen[4][-1]["role"] == "tool"
-    assert model.seen[3][-1]["tool_name"] == "check_python_syntax"
-    assert model.seen[4][-1]["tool_name"] == "run_functional_test"
-    assert model.seen[5][-1]["tool_name"] == "write_generated_file"
+    assert isinstance(model.seen[1][-1], ToolResultMessage)
+    assert "external_head.py" in model.seen[1][-1].content
+    assert isinstance(model.seen[3][-1], ToolResultMessage)
+    assert '"passed": true' in model.seen[3][-1].content
+    assert isinstance(model.seen[4][-1], ToolResultMessage)
+    assert model.seen[3][-1].tool_name == "check_python_syntax"
+    assert model.seen[4][-1].tool_name == "run_functional_test"
+    assert isinstance(model.seen[5][-1], ToolResultMessage)
+    assert model.seen[5][-1].tool_name == "write_generated_file"
     assert model.settings_seen == [
         ({"temperature": 0.55, "top_p": 0.9, "num_ctx": 32_768}, True)
     ] * 6
+
+
+def test_runner_preserves_unique_provider_call_ids_and_pairs_results() -> None:
+    model = ScriptedModel(
+        [
+            [
+                ModelChunk(
+                    tool_calls=(
+                        ToolCall("list_interface_files", {}),
+                        ToolCall("list_interface_files", {}, "agent_call_0"),
+                        ToolCall("list_interface_files", {}, "provider-call-id"),
+                        ToolCall("list_interface_files", {}, "provider-call-id"),
+                    )
+                )
+            ],
+            [ModelChunk(content="【参数补充请求】请补充策略条件。")],
+        ]
+    )
+    runner = AgentRunner(model, MemoryInterfaces(), MemoryArtifacts())
+
+    events = collect(
+        runner,
+        message="创建策略",
+        history=[],
+        model="model-a",
+        account_id="alice",
+    )
+
+    assistant_message = model.seen[1][-5]
+    tool_results = model.seen[1][-4:]
+    assert isinstance(assistant_message, AssistantMessage)
+    assert [call.call_id for call in assistant_message.tool_calls] == [
+        "agent_call_1",
+        "agent_call_0",
+        "provider-call-id",
+        "agent_call_2",
+    ]
+    assert all(isinstance(item, ToolResultMessage) for item in tool_results)
+    assert [item.call_id for item in tool_results] == [
+        call.call_id for call in assistant_message.tool_calls
+    ]
+    assert all(event.kind != "error" for event in events)
 
 
 def test_static_checker_uses_python_37_grammar() -> None:
@@ -285,7 +341,7 @@ def test_clarification_cannot_write_even_if_model_also_calls_write_tool() -> Non
 
 
 def test_followup_receives_prior_turns_and_can_create_revision() -> None:
-    source = "class RiskStrategy(RHTemplate):\n    pass\n"
+    source = _strategy_source()
     model = ScriptedModel(
         [
             [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": source}),))],
@@ -309,8 +365,8 @@ def test_followup_receives_prior_turns_and_can_create_revision() -> None:
         model="model-a",
         account_id="alice",
     )
-    assert [item["role"] for item in model.seen[0]] == ["system", "user", "assistant", "user"]
-    assert model.seen[0][-1]["content"] == "改为 3900"
+    assert [item.role for item in model.seen[0]] == ["system", "user", "assistant", "user"]
+    assert model.seen[0][-1].content == "改为 3900"
     assert artifacts.created == [("RiskStrategy.py", source, "alice")]
     assert events[-1].data["artifacts"][0]["filename"] == "RiskStrategy.py"
     assert functional_tester.calls[0]["requirements"] == [
@@ -320,8 +376,8 @@ def test_followup_receives_prior_turns_and_can_create_revision() -> None:
 
 
 def test_modified_source_must_pass_functional_test_again_before_saving() -> None:
-    original = "class RiskStrategy(RHTemplate):\n    pass\n"
-    revised = "class RiskStrategy(RHTemplate):\n    def onTick(self, tick):\n        pass\n"
+    original = _strategy_source()
+    revised = _strategy_source(body="    def onTick(self, tick):\n        pass\n")
     model = ScriptedModel(
         [
             [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": original}),))],
@@ -346,18 +402,24 @@ def test_modified_source_must_pass_functional_test_again_before_saving() -> None
 
     assert [call["source"] for call in tester.calls] == [original, revised]
     assert artifacts.created == [("RiskStrategy.py", revised, "alice")]
-    assert '"error": "保存前必须先通过同一份源码的 run_functional_test"' in model.seen[4][-1]["content"]
+    assert any(
+        '"error": "保存前必须先通过同一份源码的 run_functional_test"'
+        in item.content
+        for item in model.seen[4]
+        if isinstance(item, ToolResultMessage)
+    )
     assert events[-1].data["artifacts"][0]["filename"] == "RiskStrategy.py"
 
 
 def test_failed_functional_result_prevents_artifact_creation() -> None:
-    source = "class RiskStrategy(RHTemplate):\n    pass\n"
+    source = _strategy_source()
     model = ScriptedModel(
         [
             [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": source}),))],
             [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": source}),))],
             [ModelChunk(tool_calls=(ToolCall("write_generated_file", {"source": source}),))],
             [ModelChunk(content="当前版本尚未通过检测。")],
+            [ModelChunk(content="本轮无法保存策略。")],
         ]
     )
     artifacts = MemoryArtifacts()
@@ -377,7 +439,7 @@ def test_failed_functional_result_prevents_artifact_creation() -> None:
         )
 
     assert artifacts.created == []
-    assert "run_functional_test" in model.seen[3][-1]["content"]
+    assert "run_functional_test" in model.seen[3][-1].content
 
 
 def test_tool_round_limit() -> None:
@@ -388,7 +450,7 @@ def test_tool_round_limit() -> None:
 
 
 def test_concurrent_runs_keep_messages_and_artifacts_separate() -> None:
-    class ConcurrentModel:
+    class ConcurrentModel(ModelGateway):
         def __init__(self):
             self.rounds: dict[str, int] = {}
 
@@ -396,11 +458,11 @@ def test_concurrent_runs_keep_messages_and_artifacts_separate() -> None:
             return ["model-a"]
 
         async def stream_chat(self, model, messages, tools, *, options, think):
-            user_message = next(item["content"] for item in messages if item["role"] == "user")
+            user_message = next(item.content for item in messages if item.role == "user")
             await asyncio.sleep(0.001)
             round_index = self.rounds.get(user_message, 0)
             self.rounds[user_message] = round_index + 1
-            source = f"class {user_message.upper()}Strategy(RHTemplate):\n    pass\n"
+            source = _strategy_source(f"{user_message.upper()}Strategy")
             calls = [
                 ToolCall("check_python_syntax", {"source": source}),
                 ToolCall("run_functional_test", {"source": source}),
@@ -445,7 +507,7 @@ def test_cancelling_a_running_request_closes_the_model_stream() -> None:
         entered = asyncio.Event()
         closed = asyncio.Event()
 
-        class SlowModel:
+        class SlowModel(ModelGateway):
             async def list_models(self):
                 return ["model-a"]
 

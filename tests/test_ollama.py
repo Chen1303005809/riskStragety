@@ -5,11 +5,22 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from agent.contracts import ToolCall
-from backend.adapters.ollama import OllamaModelGateway
+import pytest
+
+from agent.contracts import (
+    AssistantMessage,
+    AssistantToolCall,
+    ModelGateway,
+    SystemMessage,
+    ToolCall,
+    ToolResultMessage,
+    UserMessage,
+)
+from backend.adapters.ollama import OllamaModelGateway, _ollama_messages
 
 
 def test_ollama_list_and_stream_conversion() -> None:
+    assert issubclass(OllamaModelGateway, ModelGateway)
     seen = {}
 
     class FakeClient:
@@ -28,7 +39,7 @@ def test_ollama_list_and_stream_conversion() -> None:
                     message=SimpleNamespace(
                         content="正在读取", tool_calls=[SimpleNamespace(function=SimpleNamespace(
                             name="read_interface_file", arguments='{"filename":"external_head.py"}'
-                        ))]
+                        ))], thinking="内部思考"
                     ),
                     done=False, prompt_eval_count=None, eval_count=None,
                 )
@@ -49,7 +60,26 @@ def test_ollama_list_and_stream_conversion() -> None:
         names = await gateway.list_models()
         chunks = [chunk async for chunk in gateway.stream_chat(
             "model-a",
-            [{"role": "user", "content": "hi"}],
+            [
+                SystemMessage("system prompt"),
+                UserMessage("hi"),
+                AssistantMessage(
+                    "读取接口",
+                    tool_calls=(
+                        AssistantToolCall(
+                            "internal-call-1",
+                            "read_interface_file",
+                            {"filename": "external_head.py"},
+                        ),
+                    ),
+                    reasoning_content="先查看源码",
+                ),
+                ToolResultMessage(
+                    content='{"files": ["external_head.py"]}',
+                    call_id="internal-call-1",
+                    tool_name="read_interface_file",
+                ),
+            ],
             [],
             options={"temperature": 0.4, "top_p": 0.9, "num_ctx": 32_768},
             think=True,
@@ -63,7 +93,37 @@ def test_ollama_list_and_stream_conversion() -> None:
     assert seen["stream"] is True
     assert seen["options"] == {"temperature": 0.4, "top_p": 0.9, "num_ctx": 32_768}
     assert seen["think"] is True
+    assert seen["messages"] == [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "读取接口",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "read_interface_file",
+                        "arguments": {"filename": "external_head.py"},
+                    }
+                }
+            ],
+            "thinking": "先查看源码",
+        },
+        {
+            "role": "tool",
+            "content": '{"files": ["external_head.py"]}',
+            "tool_name": "read_interface_file",
+        },
+    ]
     assert chunks[0].content == "正在读取"
+    assert chunks[0].reasoning_content == "内部思考"
     assert chunks[0].tool_calls == (ToolCall("read_interface_file", {"filename": "external_head.py"}),)
     assert chunks[1].usage == {"prompt_tokens": 12, "completion_tokens": 4}
     assert seen["closed"] is True
+
+
+def test_ollama_serializer_rejects_unmatched_tool_result_ids() -> None:
+    with pytest.raises(ValueError, match="没有对应的调用"):
+        _ollama_messages(
+            [ToolResultMessage("orphan", call_id="missing", tool_name="lookup")]
+        )

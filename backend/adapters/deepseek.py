@@ -1,18 +1,73 @@
-"""OpenAI-compatible streaming adapter for the DeepSeek API."""
+"""DeepSeek gateway and Chat Completions request-message structures."""
 
 from __future__ import annotations
 
 import json
-from collections import defaultdict, deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
-from agent.contracts import ModelChunk, ToolCall
+from agent.contracts import (
+    AgentMessage,
+    AssistantMessage,
+    ModelChunk,
+    ModelGateway,
+    SystemMessage,
+    ToolCall,
+    ToolResultMessage,
+    UserMessage,
+)
+from backend.adapters.provider_messages import ProviderWireMessage
 
 
-class DeepSeekModelGateway:
+@dataclass(frozen=True)
+class DeepSeekWireMessage(ProviderWireMessage):
+    role: str
+    content: str
+
+    def to_payload(self) -> dict[str, Any]:
+        return {"role": self.role, "content": self.content}
+
+
+@dataclass(frozen=True)
+class DeepSeekFunctionWireCall:
+    call_id: str
+    name: str
+    arguments: str
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "id": self.call_id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": self.arguments},
+        }
+
+
+@dataclass(frozen=True)
+class DeepSeekAssistantWireMessage(DeepSeekWireMessage):
+    tool_calls: tuple[DeepSeekFunctionWireCall, ...] = ()
+    reasoning_content: str = ""
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = super().to_payload()
+        if self.tool_calls:
+            payload["tool_calls"] = [call.to_payload() for call in self.tool_calls]
+        if self.reasoning_content:
+            payload["reasoning_content"] = self.reasoning_content
+        return payload
+
+
+@dataclass(frozen=True)
+class DeepSeekToolWireMessage(DeepSeekWireMessage):
+    tool_call_id: str
+
+    def to_payload(self) -> dict[str, Any]:
+        return {**super().to_payload(), "tool_call_id": self.tool_call_id}
+
+
+class DeepSeekModelGateway(ModelGateway):
     def __init__(
         self,
         api_key: str,
@@ -48,7 +103,7 @@ class DeepSeekModelGateway:
     async def stream_chat(
         self,
         model: str,
-        messages: list[dict[str, Any]],
+        messages: Sequence[AgentMessage],
         tools: list[dict[str, Any]],
         *,
         options: dict[str, int | float],
@@ -56,7 +111,7 @@ class DeepSeekModelGateway:
     ) -> AsyncIterator[ModelChunk]:
         request: dict[str, Any] = {
             "model": model,
-            "messages": _openai_messages(messages),
+            "messages": _deepseek_messages(messages),
             "stream": True,
             "thinking": {"type": "enabled" if think else "disabled"},
         }
@@ -120,8 +175,13 @@ class DeepSeekModelGateway:
                             if not isinstance(index, int):
                                 continue
                             pending = pending_calls.setdefault(
-                                index, {"name": "", "arguments": ""}
+                                index, {"id": "", "name": "", "arguments": ""}
                             )
+                            call_id = call.get("id")
+                            if isinstance(call_id, str) and call_id:
+                                if pending["id"] and pending["id"] != call_id:
+                                    raise ValueError("DeepSeek 流式工具调用 ID 不一致")
+                                pending["id"] = call_id
                             function = call.get("function")
                             if isinstance(function, dict):
                                 name = function.get("name")
@@ -146,71 +206,68 @@ class DeepSeekModelGateway:
             if not isinstance(arguments, dict):
                 arguments = {}
             if item["name"]:
-                calls.append(ToolCall(item["name"], arguments))
+                calls.append(
+                    ToolCall(
+                        item["name"],
+                        arguments,
+                        item["id"] or None,
+                    )
+                )
         yield ModelChunk(tool_calls=tuple(calls), usage=usage)
 
 
-def _openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Translate AgentRunner's provider-neutral tool messages to OpenAI's format."""
-    tool_call_ids: dict[str, deque[str]] = defaultdict(deque)
+def _deepseek_messages(messages: Sequence[AgentMessage]) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
-    next_call_id = 0
+    known_call_ids: set[str] = set()
+    pending_call_names: dict[str, str] = {}
     for message in messages:
-        role = message.get("role")
-        if role == "assistant" and isinstance(message.get("tool_calls"), list):
-            tool_calls = []
-            for call in message["tool_calls"]:
-                function = call.get("function") if isinstance(call, dict) else None
-                if not isinstance(function, dict):
-                    continue
-                name = function.get("name")
-                if not isinstance(name, str) or not name:
-                    continue
-                supplied_id = call.get("id") if isinstance(call, dict) else None
-                call_id = (
-                    supplied_id
-                    if isinstance(supplied_id, str) and supplied_id
-                    else f"call_{next_call_id}"
+        if isinstance(message, SystemMessage):
+            wire_message: ProviderWireMessage = DeepSeekWireMessage("system", message.content)
+        elif isinstance(message, UserMessage):
+            wire_message = DeepSeekWireMessage("user", message.content)
+        elif isinstance(message, AssistantMessage):
+            calls: list[DeepSeekFunctionWireCall] = []
+            for call in message.tool_calls:
+                if not call.call_id:
+                    raise ValueError("DeepSeek 工具调用缺少 call_id")
+                if call.call_id in known_call_ids:
+                    raise ValueError(f"DeepSeek 工具调用 ID 重复：{call.call_id}")
+                known_call_ids.add(call.call_id)
+                pending_call_names[call.call_id] = call.name
+                calls.append(
+                    DeepSeekFunctionWireCall(
+                        call_id=call.call_id,
+                        name=call.name,
+                        arguments=json.dumps(call.arguments, ensure_ascii=False),
+                    )
                 )
-                next_call_id += 1
-                arguments = function.get("arguments", {})
-                if not isinstance(arguments, str):
-                    arguments = json.dumps(arguments, ensure_ascii=False)
-                tool_call_ids[name].append(call_id)
-                tool_calls.append(
-                    {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": arguments},
-                    }
+            wire_message = DeepSeekAssistantWireMessage(
+                role="assistant",
+                content=message.content,
+                tool_calls=tuple(calls),
+                reasoning_content=message.reasoning_content,
+            )
+        elif isinstance(message, ToolResultMessage):
+            expected_tool_name = pending_call_names.get(message.call_id)
+            if expected_tool_name is None:
+                raise ValueError(
+                    f"DeepSeek 工具结果没有对应的调用：{message.call_id}"
                 )
-            converted_assistant = {
-                "role": "assistant",
-                "content": message.get("content") or "",
-                "tool_calls": tool_calls,
-            }
-            reasoning = message.get("reasoning_content")
-            if isinstance(reasoning, str) and reasoning:
-                converted_assistant["reasoning_content"] = reasoning
-            converted.append(converted_assistant)
-            continue
+            if expected_tool_name != message.tool_name:
+                raise ValueError(
+                    f"DeepSeek 工具结果名称与调用不匹配：{message.call_id}"
+                )
+            del pending_call_names[message.call_id]
+            wire_message = DeepSeekToolWireMessage(
+                role="tool",
+                content=message.content,
+                tool_call_id=message.call_id,
+            )
+        else:
+            raise TypeError(f"不支持的 Agent 消息类型：{type(message).__name__}")
+        converted.append(wire_message.to_payload())
 
-        if role == "tool":
-            name = message.get("tool_name")
-            if isinstance(name, str) and tool_call_ids[name]:
-                converted.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call_ids[name].popleft(),
-                        "content": message.get("content", ""),
-                    }
-                )
-            continue
-
-        converted_message = {
-            key: message[key]
-            for key in ("role", "content", "reasoning_content")
-            if key in message and message[key] is not None
-        }
-        converted.append(converted_message)
+    if pending_call_names:
+        missing = ", ".join(sorted(pending_call_names))
+        raise ValueError(f"DeepSeek 工具调用缺少结果：{missing}")
     return converted

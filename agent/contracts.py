@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypeAlias
 
 
 @dataclass(frozen=True)
@@ -13,10 +14,58 @@ class ChatTurn:
     content: str
 
 
+class AgentMessage:
+    """Marker base for provider-neutral messages exchanged with a model."""
+
+    role: str
+    content: str
+
+
+@dataclass(frozen=True)
+class SystemMessage(AgentMessage):
+    content: str
+    role: Literal["system"] = field(default="system", init=False)
+
+
+@dataclass(frozen=True)
+class UserMessage(AgentMessage):
+    content: str
+    role: Literal["user"] = field(default="user", init=False)
+
+
 @dataclass(frozen=True)
 class ToolCall:
     name: str
     arguments: dict[str, Any]
+    call_id: str | None = None
+
+
+@dataclass(frozen=True)
+class AssistantToolCall:
+    """A tool call stored in conversation history with a stable correlation ID."""
+
+    call_id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AssistantMessage(AgentMessage):
+    content: str
+    tool_calls: tuple[AssistantToolCall, ...] = ()
+    reasoning_content: str = ""
+    role: Literal["assistant"] = field(default="assistant", init=False)
+
+
+@dataclass(frozen=True)
+class ToolResultMessage(AgentMessage):
+    content: str
+    call_id: str
+    tool_name: str
+    role: Literal["tool"] = field(default="tool", init=False)
+
+
+ModelMessage: TypeAlias = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage
 
 
 @dataclass(frozen=True)
@@ -40,18 +89,26 @@ class AgentEvent:
     data: dict[str, Any]
 
 
-class ModelGateway(Protocol):
+class ModelGateway(ABC):
+    """Common gateway interface implemented by concrete model providers."""
+
+    @abstractmethod
     def stream_chat(
         self,
         model: str,
-        messages: list[dict[str, Any]],
+        messages: Sequence[ModelMessage],
         tools: list[dict[str, Any]],
         *,
         options: dict[str, int | float],
         think: bool,
-    ) -> AsyncIterator[ModelChunk]: ...
+    ) -> AsyncIterator[ModelChunk]:
+        raise NotImplementedError
 
+    @abstractmethod
     async def list_models(self) -> list[str]: ...
+
+    async def close(self) -> None:
+        """Release provider resources; lightweight test gateways may do nothing."""
 
 
 class InterfaceReader(Protocol):
