@@ -1,17 +1,17 @@
 # 风控策略 Agent
 
-一个由 POST 请求触发的价格风控策略生成服务。浏览器负责聊天与下载，FastAPI 负责认证和请求调度，Agent 负责提示词、Ollama 工具调用和策略生成。服务在局域网运行；网页的生产构建由同一个 Python 进程托管。
+一个由 POST 请求触发的价格风控策略生成服务。浏览器负责聊天与下载，FastAPI 负责认证和请求调度，Agent 通过 Ollama 或 DeepSeek 模型服务进行工具调用和策略生成。服务在局域网运行；网页的生产构建由同一个 Python 进程托管。
 
 ## 目录与边界
 
 | 目录 | 职责 |
 | --- | --- |
-| `frontend/` | React 页面；`src/api.ts` 集中处理 HTTP、SSE、预览和下载请求。API Key 与账号 ID 只在页面内存中。 |
-| `backend/` | FastAPI 路由、Bearer 认证、环境配置、请求校验、SSE 映射和适配器装配。 |
+| `frontend/` | React 页面；`src/api.ts` 集中处理 HTTP、SSE、预览和下载请求。服务 Bearer Key 与账号 ID 只在页面内存中。 |
+| `backend/` | FastAPI 路由、Bearer 认证、在线模型服务配置、请求校验、SSE 映射和适配器装配。 |
 | `agent/` | 原文迁移的系统提示词、按轮次添加上海日期、历史消息组织和有上限的工具调用循环。无 FastAPI 依赖。 |
 | `interfaces/价格接口/` | 从旧项目迁入的 Python 接口源码。Agent 可列出和读取，运行时不写入。 |
 | `artifacts/` | 生成的 Python 源码及迁移前遗留的 JSON 元数据。新产物归属和会话索引写入 SQLite。 |
-| `data/` | 默认 SQLite 数据库目录，保存账号、会话、消息和产物索引；可由 `APP_DATA_DIR` 调整。 |
+| `data/` | 默认 SQLite 数据库目录，保存账号、会话、消息、产物索引和 DeepSeek Key 配置；可由 `APP_DATA_DIR` 调整。 |
 
 `AgentRunner.run(...)` 是后端调用 Agent 的边界，返回异步业务事件。模型、接口读取和产物存储都经接口注入。共享 Bearer API Key 负责认证，账号 ID 负责数据归属，不是身份凭证；持有共享 Key 的调用方可以查看所有账号的监控数据。聊天时第一次使用的账号 ID（去除首尾空白后）和 UUID 会创建账号及会话，会话绑定账号且不能转移。服务端从 SQLite 恢复对话历史，并把用户消息、Agent 回复和文件关联持久化。网页的监控总览可浏览账号、会话、消息和生成文件。
 
@@ -19,17 +19,16 @@
 
 ## 本地启动
 
-需要 Conda、Node.js 20+、Docker，以及一个支持工具调用的 Ollama 模型。先安装并启动 Ollama、拉取所选模型；模型名称以 `GET /api/models` 实际返回为准。功能检测使用预先下载的 Python 3.12 容器镜像：
+需要 Python 3.12、Node.js 20+ 和 Docker。使用 Ollama 时，安装并启动 Ollama、拉取支持工具调用的模型；使用 DeepSeek 时，可在网页中配置 API Key，不需要本地启动 Ollama。功能检测使用预先下载的 Python 3.12 容器镜像：
 
 ```bash
 docker pull python:3.12-slim
 ```
 
 ```bash
-conda create -n risk-agent python=3.12 -y
-conda activate risk-agent
 cd /Users/eurus/Code/风控客制平台
-python -m pip install -r requirements.txt
+python3.12 -m venv .venv
+.venv/bin/python3.12 -m pip install -r requirements.txt
 cd frontend
 npm ci
 npm run build
@@ -37,17 +36,17 @@ cd ..
 cp .env.example .env
 ```
 
-编辑 `.env`：设置真实的长随机 `AGENT_API_KEY`、已安装的 `OLLAMA_MODEL`，必要时修改 `OLLAMA_BASE_URL`。项目启动时会自动读取项目根目录下的 `.env`；已在 shell 中设置的环境变量优先。默认服务监听 `0.0.0.0:8765`，可通过 `APP_HOST` 和 `APP_PORT` 调整。数据库默认写入 `data/monitoring.sqlite3`；设置 `APP_DATA_DIR` 可换用其他目录。启动服务：
+编辑 `.env`：设置真实的长随机 `AGENT_API_KEY`；选择 Ollama 时设置已安装的 `OLLAMA_MODEL`，必要时修改 `OLLAMA_BASE_URL`。项目启动时会自动读取项目根目录下的 `.env`；已在 shell 中设置的环境变量优先。默认服务监听 `0.0.0.0:8765`，可通过 `APP_HOST` 和 `APP_PORT` 调整。数据库默认写入 `data/`；设置 `APP_DATA_DIR` 可换用其他目录。启动服务：
 
 ```bash
-python -m backend
+.venv/bin/python3.12 -m backend
 ```
 
-在浏览器打开 `http://<服务所在主机>:8765/`，进入“监控总览”并输入 API Key 查看全部账号；进入“策略对话”后输入账号 ID 开始聊天。前端开发时，在两个终端分别启动后端和 `cd frontend && npm run dev`；Vite 会将 `/api` 代理到本机的 8765 端口。生产部署时，请限制服务仅在可信局域网可达；跨网访问可在前面加 HTTPS 反向代理。
+在浏览器打开 `http://<服务所在主机>:8765/`，进入“监控总览”并输入服务 API Key 查看全部账号；进入“策略对话”后输入账号 ID，并选择 Ollama 或 DeepSeek。首次使用 DeepSeek 时，可在连接表单填写 DeepSeek API Key；连接后也可在“模型参数”面板保存、替换或清除 Key。服务端会验证 Key 并将其保存在 `APP_DATA_DIR/provider_settings.sqlite3`（默认 `data/provider_settings.sqlite3`），数据库文件权限限制为仅服务进程用户可读写，Key 不会返回到网页。前端开发时，在两个终端分别启动后端和 `cd frontend && npm run dev`；Vite 会将 `/api` 代理到本机的 8765 端口。生产部署时，请限制服务仅在可信局域网可达；跨网访问可在前面加 HTTPS 反向代理。
 
 ## HTTP 接口
 
-所有 `/api` 接口都要求 `Authorization: Bearer <AGENT_API_KEY>`。聊天请求必须提供 `account_id`、UUID 格式的 `conversation_id` 和本轮 `message`。账号 ID 去首尾空白后区分，大小写敏感；全局唯一的会话 UUID 第一次使用时绑定账号，其他账号复用时返回 404。下载请求必须提供账号 ID，服务端会对照 SQLite 中的产物归属；归属不匹配或记录不存在时统一返回 404。聊天请求不再接收历史，历史以服务端数据库记录为准。
+所有 `/api` 接口都要求 `Authorization: Bearer <AGENT_API_KEY>`。聊天请求必须提供 `account_id`、UUID 格式的 `conversation_id` 和本轮 `message`；`provider` 可填 `ollama` 或 `deepseek`，省略时使用 `ollama`。账号 ID 去首尾空白后区分，大小写敏感；全局唯一的会话 UUID 第一次使用时绑定账号，其他账号复用时返回 404。下载请求必须提供账号 ID，服务端会对照 SQLite 中的产物归属；归属不匹配或记录不存在时统一返回 404。聊天请求不再接收历史，历史以服务端数据库记录为准。
 
 ```bash
 curl -N http://127.0.0.1:8765/api/agent/chat/stream \
@@ -78,6 +77,8 @@ curl -N http://127.0.0.1:8765/api/agent/chat/stream \
 | `file_not_generated` | SSE 正常完成，但 `artifacts` 为空 | `done` | 本轮已完成，但未生成策略文件。 |
 | `auth_invalid` | Bearer API Key 无效 | HTTP 401 | API Key 无效 |
 | `request_invalid` | 请求体、参数或 UUID 格式无效 | HTTP 422 | 请求参数无效 |
+| `provider_not_configured` | 使用 DeepSeek 前没有配置 API Key | HTTP 409 | 请先配置 DeepSeek API Key |
+| `provider_key_invalid` | DeepSeek API Key 校验失败或服务暂不可达 | HTTP 400 | DeepSeek API Key 验证失败，请检查 Key 或网络连接 |
 | `conversation_not_found` | 会话不存在或不属于该账号 | HTTP 404 | 会话不存在 |
 | `account_not_found` | 账号不存在 | HTTP 404 | 账号不存在 |
 | `artifact_not_found` | 产物不存在或不属于该账号 | HTTP 404 | 产物不存在 |
@@ -88,7 +89,7 @@ curl -N http://127.0.0.1:8765/api/agent/chat/stream \
 | `method_not_allowed` | API 请求方法不支持 | HTTP 405 | 请求方法不受支持 |
 | `internal_error` | 未分类的 API 服务端异常 | HTTP 500 | 服务内部错误，请稍后重试 |
 
-`GET /api/models` 返回已安装的 `models` 列表和服务端配置的 `default_model`。网页优先选择已安装的默认模型。
+`GET /api/models` 返回 Ollama 的模型列表；`GET /api/models?provider=deepseek` 返回 DeepSeek API 当前可用模型。响应还会给出 `deepseek_configured` 状态和 `default_model`。`GET /api/providers` 返回 provider 配置状态。`PUT /api/providers/deepseek` 使用 `{"api_key":"..."}` 验证并保存 DeepSeek Key，`DELETE /api/providers/deepseek` 清除 Key；这两个配置接口同样要求服务 Bearer Key。网页优先选择 provider 返回的默认模型。
 
 必要参数不足时，Agent 按提示词追问；用户补充后服务端从 SQLite 恢复此前历史。生成文件源码保存到 `artifacts/`，归属及会话索引写入 SQLite；Agent 不覆盖接口源码或已有文件。生成源码必须先通过 Python 3.7 语法检查，再由独立测试用例 Skill 根据对话需求构造行情用例，并在无网络、只读挂载且有限制的 Docker 沙盒中执行。沙盒模拟消息引擎及未实现的 `RHclient`；检测结果不代表真实行情引擎验证。
 

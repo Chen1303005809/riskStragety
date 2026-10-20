@@ -281,6 +281,7 @@ class AgentRunner:
 
         for round_index in range(self._max_tool_rounds + 1):
             round_content: list[str] = []
+            round_reasoning_content: list[str] = []
             calls: list[ToolCall] = []
             usage: dict[str, int] = {}
             async for chunk in self._model.stream_chat(
@@ -294,6 +295,8 @@ class AgentRunner:
                     round_content.append(chunk.content)
                     visible_content.append(chunk.content)
                     yield AgentEvent("delta", {"text": chunk.content})
+                if chunk.reasoning_content:
+                    round_reasoning_content.append(chunk.reasoning_content)
                 calls.extend(chunk.tool_calls)
                 if chunk.usage:
                     usage = chunk.usage
@@ -314,8 +317,11 @@ class AgentRunner:
             if not calls:
                 if tool_failure_repair_pending:
                     assistant_content = "".join(round_content)
-                    if assistant_content.strip():
-                        messages.append({"role": "assistant", "content": assistant_content})
+                    if assistant_content.strip() or round_reasoning_content:
+                        assistant_message = {"role": "assistant", "content": assistant_content}
+                        if round_reasoning_content:
+                            assistant_message["reasoning_content"] = "".join(round_reasoning_content)
+                        messages.append(assistant_message)
                     messages.append({"role": "user", "content": TOOL_FAILURE_REPAIR_PROMPT})
                     tool_failure_repair_pending = False
                     continue
@@ -355,16 +361,17 @@ class AgentRunner:
                     failure_context=_failure_context(message, tool_failures),
                 )
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": "".join(round_content),
-                    "tool_calls": [
-                        {"function": {"name": call.name, "arguments": call.arguments}}
-                        for call in calls
-                    ],
-                }
-            )
+            assistant_message = {
+                "role": "assistant",
+                "content": "".join(round_content),
+                "tool_calls": [
+                    {"function": {"name": call.name, "arguments": call.arguments}}
+                    for call in calls
+                ],
+            }
+            if round_reasoning_content:
+                assistant_message["reasoning_content"] = "".join(round_reasoning_content)
+            messages.append(assistant_message)
             tool_failure_repair_pending = False
             for call in calls:
                 yield AgentEvent("status", {"phase": "tool_started", "tool": call.name})

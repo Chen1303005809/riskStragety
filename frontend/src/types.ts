@@ -1,4 +1,5 @@
 export type ChatRole = 'user' | 'assistant';
+export type ModelProvider = 'ollama' | 'deepseek';
 
 export interface ChatTurn {
   role: ChatRole;
@@ -26,6 +27,7 @@ export interface ChatRequest {
   account_id: string;
   conversation_id: string;
   message: string;
+  provider?: ModelProvider;
   /** Accepted for source compatibility; streamChat intentionally omits this legacy field. */
   history?: ChatTurn[];
   model?: string;

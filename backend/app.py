@@ -22,15 +22,17 @@ from agent.functional_tests import SkillFunctionalTester, SkillTestCaseBuilder
 from agent.runner import AgentRunner
 from agent.skills import FilesystemSkillLoader
 from backend.adapters.files import IndexedArtifactWriter, LocalArtifactStore, LocalInterfaceReader
+from backend.adapters.provider_settings import ProviderSettingsStore
 from backend.adapters.monitoring import (
     AccountNotFound,
     ConversationNotFound,
     MonitoringStore,
 )
 from backend.adapters.sandbox import DockerFunctionalSandbox
+from backend.adapters.deepseek import DeepSeekModelGateway
 from backend.adapters.ollama import OllamaModelGateway
 from backend.config import Settings
-from backend.schemas import ChatRequest, DownloadRequest
+from backend.schemas import ChatRequest, DeepSeekKeyRequest, DownloadRequest
 from backend.security import Principal, require_principal
 
 
@@ -41,6 +43,8 @@ ERROR_MESSAGES = {
     "file_not_generated": "本轮已完成，但未生成策略文件。",
     "auth_invalid": "API Key 无效",
     "request_invalid": "请求参数无效",
+    "provider_not_configured": "请先配置 DeepSeek API Key",
+    "provider_key_invalid": "DeepSeek API Key 验证失败，请检查 Key 或网络连接",
     "conversation_not_found": "会话不存在",
     "account_not_found": "账号不存在",
     "artifact_not_found": "产物不存在",
@@ -145,20 +149,24 @@ def create_app(
     model = model_gateway or OllamaModelGateway(config.ollama_base_url)
     artifacts = artifact_store or LocalArtifactStore(config.project_root / "artifacts")
     monitoring = MonitoringStore(config.data_dir / "monitoring.sqlite3", artifacts.directory)
+    provider_settings = ProviderSettingsStore(config.data_dir / "provider_settings.sqlite3")
     interface_directory = config.project_root / "interfaces" / "价格接口"
-    if agent_runner is None:
+    interfaces = LocalInterfaceReader(interface_directory)
+    artifact_writer = IndexedArtifactWriter(artifacts, monitoring)
+    sandbox = DockerFunctionalSandbox(interface_directory, config.project_root)
+
+    def build_runner(gateway: ModelGateway) -> AgentRunner:
         selected_tester = functional_tester or SkillFunctionalTester(
-            SkillTestCaseBuilder(model, FilesystemSkillLoader()),
-            DockerFunctionalSandbox(interface_directory, config.project_root),
+            SkillTestCaseBuilder(gateway, FilesystemSkillLoader()), sandbox
         )
-        runner = AgentRunner(
-            model,
-            LocalInterfaceReader(interface_directory),
-            IndexedArtifactWriter(artifacts, monitoring),
+        return AgentRunner(
+            gateway,
+            interfaces,
+            artifact_writer,
             functional_tester=selected_tester,
         )
-    else:
-        runner = agent_runner
+
+    runner = agent_runner or build_runner(model)
     conversation_locks = _ConversationLockPool()
 
     @asynccontextmanager
@@ -171,6 +179,7 @@ def create_app(
     app = FastAPI(title="风控策略 Agent", lifespan=lifespan)
     app.state.settings = config
     app.state.monitoring = monitoring
+    app.state.provider_settings = provider_settings
 
     @app.exception_handler(MappedHTTPException)
     async def mapped_http_exception_handler(
@@ -203,16 +212,69 @@ def create_app(
             CORSMiddleware,
             allow_origins=list(config.cors_origins),
             allow_credentials=False,
-            allow_methods=["GET", "POST"],
+            allow_methods=["GET", "POST", "PUT", "DELETE"],
             allow_headers=["Authorization", "Content-Type"],
         )
 
+    @app.get("/api/providers")
+    async def providers(_: Principal = Depends(require_principal)) -> dict[str, object]:
+        return {
+            "providers": [
+                {"id": "ollama", "name": "Ollama", "configured": True},
+                {
+                    "id": "deepseek",
+                    "name": "DeepSeek",
+                    "configured": provider_settings.get_deepseek_api_key() is not None,
+                },
+            ]
+        }
+
+    @app.put("/api/providers/deepseek")
+    async def configure_deepseek(
+        payload: DeepSeekKeyRequest, _: Principal = Depends(require_principal)
+    ) -> dict[str, object]:
+        gateway = DeepSeekModelGateway(payload.api_key)
+        try:
+            names = await gateway.list_models()
+        except Exception as exc:
+            raise MappedHTTPException(400, "provider_key_invalid") from exc
+        finally:
+            await gateway.close()
+        provider_settings.set_deepseek_api_key(payload.api_key)
+        return {"provider": "deepseek", "configured": True, "models": names}
+
+    @app.delete("/api/providers/deepseek")
+    async def remove_deepseek(_: Principal = Depends(require_principal)) -> dict[str, object]:
+        provider_settings.delete_deepseek_api_key()
+        return {"provider": "deepseek", "configured": False}
+
     @app.get("/api/models")
-    async def models(_: Principal = Depends(require_principal)) -> dict[str, object]:
+    async def models(
+        provider: str = Query(default="ollama", pattern="^(ollama|deepseek)$"),
+        _: Principal = Depends(require_principal),
+    ) -> dict[str, object]:
+        if provider == "deepseek":
+            api_key = provider_settings.get_deepseek_api_key()
+            if api_key is None:
+                raise MappedHTTPException(409, "provider_not_configured")
+            gateway = DeepSeekModelGateway(api_key)
+            try:
+                names = await gateway.list_models()
+                default_model = "deepseek-flash" if "deepseek-flash" in names else (names[0] if names else "")
+                return {
+                    "models": names,
+                    "default_model": default_model,
+                    "deepseek_configured": True,
+                }
+            except Exception as exc:
+                raise MappedHTTPException(502, "model_service_unavailable") from exc
+            finally:
+                await gateway.close()
         try:
             return {
                 "models": await model.list_models(),
                 "default_model": config.ollama_model,
+                "deepseek_configured": provider_settings.get_deepseek_api_key() is not None,
             }
         except Exception as exc:
             raise MappedHTTPException(502, "model_service_unavailable") from exc
@@ -221,7 +283,14 @@ def create_app(
     async def chat(
         payload: ChatRequest, principal: Principal = Depends(require_principal)
     ) -> StreamingResponse:
-        selected_model = payload.model or config.ollama_model
+        selected_model = payload.model or (
+            config.ollama_model if payload.provider == "ollama" else "deepseek-flash"
+        )
+        deepseek_api_key = None
+        if payload.provider == "deepseek":
+            deepseek_api_key = provider_settings.get_deepseek_api_key()
+            if deepseek_api_key is None:
+                raise MappedHTTPException(409, "provider_not_configured")
         conversation_id = str(payload.conversation_id)
         try:
             await monitoring.prepare_conversation(
@@ -231,6 +300,16 @@ def create_app(
             raise MappedHTTPException(404, "conversation_not_found") from exc
 
         async def stream():
+            provider_gateway = (
+                DeepSeekModelGateway(deepseek_api_key)
+                if deepseek_api_key is not None
+                else None
+            )
+            selected_runner = (
+                build_runner(provider_gateway)
+                if provider_gateway is not None and agent_runner is None
+                else runner
+            )
             partial_content: list[str] = []
             assistant_message_id: int | None = None
             turn_finalized = False
@@ -253,7 +332,7 @@ def create_app(
                         payload.account_id, conversation_id, payload.message
                     )
                     history = [ChatTurn(role, content) for role, content in history_rows]
-                    async for event in runner.run(
+                    async for event in selected_runner.run(
                         message=payload.message,
                         history=history,
                         model=selected_model,
@@ -350,6 +429,9 @@ def create_app(
                     ),
                     conversation_id=conversation_id,
                 )
+            finally:
+                if provider_gateway is not None:
+                    await provider_gateway.close()
 
         return StreamingResponse(
             stream(),

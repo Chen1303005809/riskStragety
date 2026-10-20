@@ -9,6 +9,8 @@ import {
   fetchMonitorConversation,
   fetchMonitorConversations,
   parsePythonFile,
+  removeDeepSeekApiKey,
+  saveDeepSeekApiKey,
   streamChat,
 } from './api';
 import type {
@@ -19,6 +21,7 @@ import type {
   ConversationDetail,
   ConversationSummary,
   ModelOptions,
+  ModelProvider,
   MonitorConversationsPage,
   Page,
 } from './types';
@@ -429,6 +432,11 @@ export default function App() {
   const [conversationId, setConversationId] = useState(() => createUuid());
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState('');
+  const [provider, setProvider] = useState<ModelProvider>('ollama');
+  const [deepseekConfigured, setDeepseekConfigured] = useState(false);
+  const [deepseekKeyDraft, setDeepseekKeyDraft] = useState('');
+  const [savingProviderKey, setSavingProviderKey] = useState(false);
+  const [providerKeyMessage, setProviderKeyMessage] = useState('');
   const [modelOptions, setModelOptions] = useState<ModelOptions>({
     temperature: 0.3,
     top_p: 0.8,
@@ -487,10 +495,18 @@ export default function App() {
     setConnecting(true);
     setConnectionError('');
     try {
-      const { models: names, defaultModel } = await fetchModels(key);
-      if (!names.length) throw new Error('Ollama 中没有已安装的模型');
+      if (provider === 'deepseek' && deepseekKeyDraft.trim()) {
+        await saveDeepSeekApiKey(key, deepseekKeyDraft.trim());
+        setDeepseekKeyDraft('');
+      }
+      const result = await fetchModels(key, provider);
+      const { models: names, defaultModel } = result;
+      if (!names.length) {
+        throw new Error(provider === 'ollama' ? 'Ollama 中没有已安装的模型' : 'DeepSeek 暂无可用模型');
+      }
       setApiKey(key);
       setKeyDraft('');
+      setDeepseekConfigured(result.deepseekConfigured || provider === 'deepseek');
       setAccountId(account);
       setAccountIdDraft('');
       setModels(names);
@@ -509,10 +525,65 @@ export default function App() {
     setAccountIdDraft('');
     setModels([]);
     setModel('');
+    setProvider('ollama');
     setConversationId(createUuid());
     setPreview(null);
     commitMessages([]);
     setNotice('');
+  }
+
+  async function selectProvider(nextProvider: ModelProvider) {
+    if (nextProvider === provider || !apiKey || busy) return;
+    setConnecting(true);
+    setNotice('');
+    try {
+      const result = await fetchModels(apiKey, nextProvider);
+      if (!result.models.length) {
+        throw new Error(nextProvider === 'ollama' ? 'Ollama 中没有已安装的模型' : 'DeepSeek 暂无可用模型');
+      }
+      setProvider(nextProvider);
+      setDeepseekConfigured(result.deepseekConfigured || nextProvider === 'deepseek');
+      setModels(result.models);
+      setModel(result.models.includes(result.defaultModel) ? result.defaultModel : result.models[0]);
+      setThink(false);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '无法切换模型服务');
+    } finally {
+      setConnecting(false);
+    }
+  }
+
+  async function saveProviderKey() {
+    const value = deepseekKeyDraft.trim();
+    if (!apiKey || !value || savingProviderKey) return;
+    setSavingProviderKey(true);
+    setProviderKeyMessage('');
+    try {
+      await saveDeepSeekApiKey(apiKey, value);
+      setDeepseekKeyDraft('');
+      setDeepseekConfigured(true);
+      setProviderKeyMessage('DeepSeek API Key 已保存');
+    } catch (error) {
+      setProviderKeyMessage(error instanceof Error ? error.message : '保存失败');
+    } finally {
+      setSavingProviderKey(false);
+    }
+  }
+
+  async function clearProviderKey() {
+    if (!apiKey || savingProviderKey) return;
+    setSavingProviderKey(true);
+    setProviderKeyMessage('');
+    try {
+      await removeDeepSeekApiKey(apiKey);
+      setDeepseekConfigured(false);
+      setProviderKeyMessage('DeepSeek API Key 已清除');
+      if (provider === 'deepseek') setNotice('DeepSeek API Key 已清除，请切换到 Ollama 或重新配置 Key。');
+    } catch (error) {
+      setProviderKeyMessage(error instanceof Error ? error.message : '清除失败');
+    } finally {
+      setSavingProviderKey(false);
+    }
   }
 
   function newConversation() {
@@ -526,6 +597,10 @@ export default function App() {
   async function send(event?: FormEvent) {
     event?.preventDefault();
     const message = draft.trim();
+    if (provider === 'deepseek' && !deepseekConfigured) {
+      setNotice('请先配置 DeepSeek API Key');
+      return;
+    }
     if (!apiKey || !model || !message || busy) return;
     const user = makeMessage('user', message, 'complete');
     const assistant = makeMessage('assistant', '', 'streaming');
@@ -542,6 +617,7 @@ export default function App() {
         account_id: accountId,
         conversation_id: conversationId,
         message,
+        provider,
         model,
         options: modelOptions,
         think,
@@ -632,9 +708,12 @@ export default function App() {
       let availableModels = models;
       let selectedModel = model;
       if (!availableModels.length) {
-        const result = await fetchModels(apiKey);
+        const result = await fetchModels(apiKey, provider);
         availableModels = result.models;
-        if (!availableModels.length) throw new Error('Ollama 中没有已安装的模型');
+        if (!availableModels.length) {
+          throw new Error(provider === 'ollama' ? 'Ollama 中没有已安装的模型' : 'DeepSeek 暂无可用模型');
+        }
+        setDeepseekConfigured(result.deepseekConfigured || provider === 'deepseek');
         selectedModel = availableModels.includes(result.defaultModel) ? result.defaultModel : availableModels[0];
       }
       const restored = await fetchConversationForChat(apiKey, ownerAccountId, selectedConversationId);
@@ -706,12 +785,23 @@ export default function App() {
               <span className="account-context" title={'账号 ID：' + accountId}>
                 <small>ACCOUNT</small><strong>{accountId}</strong>
               </span>
-              <label className="model-control">
-                <span>模型</span>
-                <select value={model} onChange={(event) => setModel(event.target.value)} disabled={busy}>
+              <div className="model-control">
+                <label htmlFor="provider-select">服务</label>
+                <select
+                  id="provider-select"
+                  value={provider}
+                  onChange={(event) => void selectProvider(event.target.value as ModelProvider)}
+                  disabled={busy || connecting}
+                  aria-label="模型服务"
+                >
+                  <option value="ollama">Ollama</option>
+                  <option value="deepseek">DeepSeek</option>
+                </select>
+                <label htmlFor="model-select">模型</label>
+                <select id="model-select" value={model} onChange={(event) => setModel(event.target.value)} disabled={busy || connecting}>
                   {models.map((name) => <option key={name} value={name}>{name}</option>)}
                 </select>
-              </label>
+              </div>
               <details className="model-settings">
                 <summary>模型参数</summary>
                 <div className="model-settings-panel">
@@ -725,7 +815,7 @@ export default function App() {
                     />
                     <span>启用思考模式</span>
                   </label>
-                  <label>
+                  {provider === 'ollama' && <label>
                     <span>上下文长度</span>
                     <input
                       aria-label="上下文长度"
@@ -737,7 +827,7 @@ export default function App() {
                       onChange={(event) => updateModelOption('num_ctx', event.target.value)}
                       disabled={busy}
                     />
-                  </label>
+                  </label>}
                   <label>
                     <span>Temperature</span>
                     <input
@@ -764,6 +854,36 @@ export default function App() {
                       disabled={busy}
                     />
                   </label>
+                  <div className="provider-key-settings">
+                    <strong>DeepSeek API Key</strong>
+                    <span className={deepseekConfigured ? 'provider-key-status configured' : 'provider-key-status'}>
+                      {deepseekConfigured ? '已配置' : '未配置'}
+                    </span>
+                    <input
+                      type="password"
+                      value={deepseekKeyDraft}
+                      onChange={(event) => setDeepseekKeyDraft(event.target.value)}
+                      placeholder={deepseekConfigured ? '输入新 Key 以替换' : '粘贴 DeepSeek API Key'}
+                      autoComplete="new-password"
+                      aria-label="DeepSeek API Key"
+                      disabled={savingProviderKey || busy || connecting}
+                    />
+                    <div className="provider-key-actions">
+                      <button
+                        type="button"
+                        onClick={() => void saveProviderKey()}
+                        disabled={!deepseekKeyDraft.trim() || savingProviderKey || busy || connecting}
+                      >{savingProviderKey ? '保存中…' : '保存 Key'}</button>
+                      {deepseekConfigured && <button
+                        type="button"
+                        className="secondary"
+                        onClick={() => void clearProviderKey()}
+                        disabled={savingProviderKey || busy || connecting}
+                      >清除</button>}
+                    </div>
+                    {providerKeyMessage && <small role="status">{providerKeyMessage}</small>}
+                    <p>Key 保存在服务端，仅用于 DeepSeek 请求，不会再次返回到网页。</p>
+                  </div>
                 </div>
               </details>
               <span className="connected"><span className="connected-dot" /> 已连接</span>
@@ -799,9 +919,13 @@ export default function App() {
             <div>
               <span className="eyebrow">连接服务</span>
               <h2>输入 API Key 开始</h2>
-              <p>密钥只保留在当前页面内存；账号 ID 会用于会话和文件的数据归属。</p>
+              <p>服务 API Key 只保留在当前页面内存；DeepSeek API Key 验证后保存在服务端配置库。</p>
             </div>
             <form onSubmit={connect} className="connection-form">
+              <select value={provider} onChange={(event) => setProvider(event.target.value as ModelProvider)} aria-label="模型服务">
+                <option value="ollama">Ollama</option>
+                <option value="deepseek">DeepSeek</option>
+              </select>
               <input
                 type="text"
                 value={accountIdDraft}
@@ -819,6 +943,14 @@ export default function App() {
                 autoComplete="off"
                 aria-label="API Key"
                 required
+              />}
+              {provider === 'deepseek' && <input
+                type="password"
+                value={deepseekKeyDraft}
+                onChange={(event) => setDeepseekKeyDraft(event.target.value)}
+                placeholder="DeepSeek API Key（已保存可留空）"
+                autoComplete="new-password"
+                aria-label="DeepSeek API Key"
               />}
               <button type="submit" disabled={connecting}>{connecting ? '连接中…' : '连接并读取模型'}</button>
             </form>

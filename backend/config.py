@@ -39,8 +39,6 @@ class Settings:
         if not api_key or api_key == "replace-with-a-long-random-secret":
             raise ValueError("启动前必须设置非示例的 AGENT_API_KEY")
         model = os.environ.get("OLLAMA_MODEL", "").strip()
-        if not model:
-            raise ValueError("启动前必须设置 OLLAMA_MODEL")
         try:
             port = int(os.environ.get("APP_PORT", "8765"))
         except ValueError as exc:

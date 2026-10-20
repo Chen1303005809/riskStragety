@@ -57,6 +57,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   border: 1px solid #d9e2db; border-radius: 8px; color: #183127;
   padding: 0 32px 0 11px; background: #fafcf9;
 }
+.model-control select[aria-label="模型服务"] { min-width: 112px; max-width: 140px; }
 .model-settings { position: relative; }
 .model-settings summary {
   list-style: none; height: 37px; display: flex; align-items: center;
@@ -209,18 +210,38 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 }
 .connection-card h2 { font-size: 25px; letter-spacing: -.03em; margin: 9px 0 8px; }
 .connection-card p { color: #748179; font-size: 14px; line-height: 1.65; margin: 0; }
-.connection-form { display: flex; gap: 10px; margin-top: 31px; max-width: 610px; }
-.connection-form input {
-  min-width: 0; flex: 1; border: 1px solid #d9e2db; border-radius: 9px;
+.connection-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 31px; max-width: 680px; }
+.connection-form input, .connection-form select {
+  width: 100%; min-width: 0; border: 1px solid #d9e2db; border-radius: 9px;
   height: 46px; background: #f9fbf8; padding: 0 15px; outline: none;
 }
-.connection-form input:focus { border-color: #47a681; }
+.connection-form input:focus, .connection-form select:focus { border-color: #47a681; }
 .connection-form button, .send-button, .preview-actions > button:first-child {
   border: 0; border-radius: 9px; background: #146650; color: white;
   padding: 0 19px; font-weight: 600; font-size: 13px;
 }
+.connection-form button { min-height: 46px; grid-column: 1 / -1; }
 .connection-form button:hover, .send-button:hover, .preview-actions > button:first-child:hover { background: #0d523f; }
 .inline-error { margin-top: 15px !important; color: #ae3b3b !important; }
+.provider-key-settings {
+  display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 9px 10px;
+  margin-top: 16px; padding-top: 15px; border-top: 1px solid #edf1ec;
+}
+.provider-key-settings > strong { font-size: 12px; }
+.provider-key-status { color: #9a6c43; font-size: 11px; }
+.provider-key-status.configured { color: #26714e; }
+.provider-key-settings > input {
+  grid-column: 1 / -1; width: 100%; height: 36px; padding: 0 9px;
+  border: 1px solid #d9e2db; border-radius: 7px; background: #fbfdfb;
+}
+.provider-key-actions { display: flex; gap: 7px; }
+.provider-key-actions button {
+  height: 31px; border: 0; border-radius: 7px; background: #146650;
+  color: #fff; padding: 0 10px; font-size: 11px;
+}
+.provider-key-actions button.secondary { border: 1px solid #d9e2db; background: #fff; color: #6a786f; }
+.provider-key-settings > small[role="status"] { align-self: center; color: #26714e; font-size: 10px; }
+.provider-key-settings > p { grid-column: 1 / -1; margin: 0; color: #89948d; font-size: 10px; line-height: 1.5; }
 
 .chat-panel {
   min-height: min(640px, calc(100vh - 235px));
@@ -305,7 +326,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .workspace-heading h1 { font-size: 27px; }
   .workspace-heading p { font-size: 13px; }
   .connection-card { padding: 27px 22px; }
-  .connection-form { flex-direction: column; }
+  .connection-form { grid-template-columns: minmax(0, 1fr); }
   .connection-form button { min-height: 44px; }
   .chat-panel { min-height: calc(100vh - 280px); }
   .conversation { padding: 17px 16px; max-height: calc(100vh - 370px); }

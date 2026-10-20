@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator
@@ -26,6 +27,7 @@ class ChatRequest(BaseModel):
     account_id: StrictStr = Field(min_length=1, max_length=128)
     conversation_id: UUID
     message: str = Field(min_length=1, max_length=20_000)
+    provider: Literal["ollama", "deepseek"] = "ollama"
     model: str | None = Field(default=None, min_length=1, max_length=256)
     options: ModelOptions = Field(default_factory=ModelOptions)
     think: StrictBool = False
@@ -36,6 +38,20 @@ class ChatRequest(BaseModel):
         normalized = value.strip()
         if not normalized:
             raise ValueError("account_id must not be blank")
+        return normalized
+
+
+class DeepSeekKeyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    api_key: StrictStr = Field(min_length=1, max_length=512)
+
+    @field_validator("api_key")
+    @classmethod
+    def require_nonblank_api_key(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("api_key must not be blank")
         return normalized
 
 

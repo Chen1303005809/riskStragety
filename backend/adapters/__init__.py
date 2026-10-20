@@ -1,1 +1,1 @@
-"""Adapters connected to the agent's resource interfaces."""
+"""Adapters for external services and local resources."""

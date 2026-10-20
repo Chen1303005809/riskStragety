@@ -7,6 +7,7 @@ import type {
   ConversationSummary,
   DoneEvent,
   MonitorConversationsPage,
+  ModelProvider,
   Page,
 } from './types';
 
@@ -49,18 +50,45 @@ async function responseError(response: Response): Promise<Error> {
   return new ApiError(message || 'HTTP ' + response.status, errCode);
 }
 
-export async function fetchModels(apiKey: string): Promise<{ models: string[]; defaultModel: string }> {
-  const response = await fetch('/api/models', {
+export async function fetchModels(apiKey: string, provider: ModelProvider = 'ollama'): Promise<{
+  models: string[];
+  defaultModel: string;
+  deepseekConfigured: boolean;
+}> {
+  const path = provider === 'ollama' ? '/api/models' : '/api/models?provider=' + provider;
+  const response = await fetch(path, {
     headers: authHeaders(apiKey),
     cache: 'no-store',
   });
   if (!response.ok) throw await responseError(response);
-  const data = await response.json() as { models?: unknown; default_model?: unknown };
+  const data = await response.json() as {
+    models?: unknown;
+    default_model?: unknown;
+    deepseek_configured?: unknown;
+  };
   if (!Array.isArray(data.models)) throw new Error('模型列表格式无效');
   return {
     models: data.models.filter((name): name is string => typeof name === 'string'),
     defaultModel: typeof data.default_model === 'string' ? data.default_model : '',
+    deepseekConfigured: data.deepseek_configured === true,
   };
+}
+
+export async function saveDeepSeekApiKey(apiKey: string, providerApiKey: string): Promise<void> {
+  const response = await fetch('/api/providers/deepseek', {
+    method: 'PUT',
+    headers: authHeaders(apiKey),
+    body: JSON.stringify({ api_key: providerApiKey }),
+  });
+  await jsonResponse<{ configured: boolean }>(response);
+}
+
+export async function removeDeepSeekApiKey(apiKey: string): Promise<void> {
+  const response = await fetch('/api/providers/deepseek', {
+    method: 'DELETE',
+    headers: authHeaders(apiKey),
+  });
+  await jsonResponse<{ configured: boolean }>(response);
 }
 
 async function jsonResponse<T>(response: Response): Promise<T> {

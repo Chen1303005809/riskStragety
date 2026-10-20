@@ -24,6 +24,7 @@ class ModelChunk:
     content: str = ""
     tool_calls: tuple[ToolCall, ...] = ()
     usage: dict[str, int] = field(default_factory=dict)
+    reasoning_content: str = ""
 
 
 @dataclass(frozen=True)
