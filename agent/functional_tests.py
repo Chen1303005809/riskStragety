@@ -312,6 +312,23 @@ class SkillFunctionalTester:
             index for index, result in enumerate(results, start=1)
             if result["passed"] is False
         ]
+        failed_cases: list[dict[str, Any]] = []
+        for index, (case, result) in enumerate(zip(cases, results), start=1):
+            if result["passed"] is not False:
+                continue
+            failure: dict[str, Any] = {
+                "index": index,
+                "name": case.name,
+                "ticks": [tick.as_payload() for tick in case.ticks],
+                "expected_warning_count": case.expected_warning_count,
+            }
+            actual = result.get("actual_warning_count")
+            if actual is not None:
+                failure["actual_warning_count"] = actual
+            error = result.get("error")
+            if error is not None:
+                failure["error"] = str(error)
+            failed_cases.append(failure)
         logger.info(
             "functional_test_sandbox_finished model=%s passed=%s case_count=%d "
             "failed_case_indexes=%s",
@@ -324,6 +341,7 @@ class SkillFunctionalTester:
             "passed": passed,
             "case_count": len(results),
             "cases": results,
+            "failed_cases": failed_cases,
         }
 
 

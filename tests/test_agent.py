@@ -442,6 +442,135 @@ def test_failed_functional_result_prevents_artifact_creation() -> None:
     assert "run_functional_test" in model.seen[3][-1].content
 
 
+def test_unchanged_source_after_functional_failure_is_not_retested() -> None:
+    source = _strategy_source()
+
+    class FailingFunctionalTester:
+        def __init__(self) -> None:
+            self.sources: list[str] = []
+
+        async def run(self, candidate, *, requirements, model, options):
+            self.sources.append(candidate)
+            return {
+                "passed": False,
+                "case_count": 1,
+                "cases": [
+                    {
+                        "name": "第二个完整周期再次触发",
+                        "passed": False,
+                        "expected_warning_count": 2,
+                        "actual_warning_count": 1,
+                    }
+                ],
+                "failed_cases": [
+                    {
+                        "index": 1,
+                        "name": "第二个完整周期再次触发",
+                        "ticks": [
+                            {"vtSymbol": "AP701", "lastPrice": 5976.0},
+                            {"vtSymbol": "AP701", "lastPrice": 5969.0},
+                        ],
+                        "expected_warning_count": 2,
+                        "actual_warning_count": 1,
+                    }
+                ],
+            }
+
+    tester = FailingFunctionalTester()
+    model = ScriptedModel(
+        [
+            [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": source}),))],
+        ]
+    )
+
+    with pytest.raises(AgentError, match="源码与此前失败版本完全相同") as error:
+        collect(
+            AgentRunner(
+                model,
+                MemoryInterfaces(),
+                MemoryArtifacts(),
+                functional_tester=tester,
+            ),
+            message="生成策略",
+            history=[],
+            model="model-a",
+            account_id="alice",
+        )
+
+    assert tester.sources == [source]
+    assert "第二个完整周期再次触发" in (error.value.failure_context or "")
+    assert '"lastPrice": 5976.0' in (error.value.failure_context or "")
+    assert any(
+        isinstance(item, ToolResultMessage) and "failed_cases" in item.content
+        for item in model.seen[2]
+    )
+    assert any(
+        item.role == "user" and "逐笔按其中的 ticks" in item.content
+        for item in model.seen[2]
+    )
+
+
+def test_changed_source_can_be_functionally_tested_after_a_failure() -> None:
+    original = _strategy_source()
+    revised = _strategy_source(body="    def onTick(self, tick):\n        pass\n")
+
+    class FailThenPassFunctionalTester:
+        def __init__(self) -> None:
+            self.sources: list[str] = []
+
+        async def run(self, candidate, *, requirements, model, options):
+            self.sources.append(candidate)
+            if len(self.sources) == 1:
+                return {
+                    "passed": False,
+                    "case_count": 1,
+                    "cases": [{"name": "case", "passed": False}],
+                    "failed_cases": [
+                        {
+                            "index": 1,
+                            "name": "case",
+                            "ticks": [{"vtSymbol": "rb2710", "lastPrice": 3801.0}],
+                            "expected_warning_count": 1,
+                            "actual_warning_count": 0,
+                        }
+                    ],
+                }
+            return {"passed": True, "case_count": 1, "cases": [{"name": "case", "passed": True}]}
+
+    tester = FailThenPassFunctionalTester()
+    model = ScriptedModel(
+        [
+            [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": original}),))],
+            [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": original}),))],
+            [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": revised}),))],
+            [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": revised}),))],
+            [ModelChunk(tool_calls=(ToolCall("write_generated_file", {"source": revised}),))],
+            [ModelChunk(content="已完成修改。")],
+        ]
+    )
+    artifacts = MemoryArtifacts()
+
+    events = collect(
+        AgentRunner(
+            model,
+            MemoryInterfaces(),
+            artifacts,
+            functional_tester=tester,
+        ),
+        message="生成并修正策略",
+        history=[],
+        model="model-a",
+        account_id="alice",
+    )
+
+    assert tester.sources == [original, revised]
+    assert artifacts.created == [("RiskStrategy.py", revised, "alice")]
+    assert events[-1].data["content"] == "已完成修改。"
+
+
 def test_tool_round_limit() -> None:
     model = ScriptedModel([[ModelChunk(tool_calls=(ToolCall("list_interface_files", {}),))]] * 3)
     runner = AgentRunner(model, MemoryInterfaces(), MemoryArtifacts(), max_tool_rounds=2)

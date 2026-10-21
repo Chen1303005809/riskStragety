@@ -57,10 +57,13 @@ class MemorySandbox:
     def __init__(self) -> None:
         self.source: str | None = None
         self.cases: Sequence[FunctionalTestCase] = ()
+        self.results: list[dict[str, Any]] | None = None
 
     async def run(self, source: str, cases: Sequence[FunctionalTestCase]):
         self.source = source
         self.cases = cases
+        if self.results is not None:
+            return self.results
         return [
             {
                 "name": case.name,
@@ -262,3 +265,52 @@ def test_skill_functional_tester_runs_built_cases() -> None:
     assert result["case_count"] == 1
     assert sandbox.source == source
     assert sandbox.cases[0].expected_warning_count == 0
+
+
+def test_skill_functional_tester_returns_failed_case_inputs() -> None:
+    ticks = [
+        {"vtSymbol": "AP701", "lastPrice": 5976.0},
+        {"vtSymbol": "AP701", "lastPrice": 5969.0},
+    ]
+    model = CaseModel(
+        {
+            "cases": [
+                {
+                    "name": "第二个完整周期再次触发",
+                    "ticks": ticks,
+                    "expected_warning_count": 2,
+                }
+            ]
+        }
+    )
+    sandbox = MemorySandbox()
+    sandbox.results = [
+        {
+            "name": "第二个完整周期再次触发",
+            "passed": False,
+            "expected_warning_count": 2,
+            "actual_warning_count": 1,
+        }
+    ]
+
+    result = asyncio.run(
+        SkillFunctionalTester(
+            SkillTestCaseBuilder(model, MemorySkillLoader()), sandbox
+        ).run(
+            "class RiskStrategy(RHTemplate):\n    pass\n",
+            requirements=[ChatTurn("user", "测试重复触发")],
+            model="model-a",
+            options={"num_ctx": 16_384},
+        )
+    )
+
+    assert result["passed"] is False
+    assert result["failed_cases"] == [
+        {
+            "index": 1,
+            "name": "第二个完整周期再次触发",
+            "ticks": ticks,
+            "expected_warning_count": 2,
+            "actual_warning_count": 1,
+        }
+    ]
