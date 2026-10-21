@@ -52,7 +52,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "lookup_exchange_by_contract_code",
-            "description": "离线识别境内六家期货交易所的期货合约。用户给出合约代码时传 contract_code；用户给出品种名称和交割月份时传 product_name 与 month，并可传 year、exchange_code，让工具直接推导并核验标准代码。CZCE 合约后缀为三位数字（一位年份加两位月份），其他交易所为四位数字。唯一匹配且状态为 matched 时无需向用户确认。canonical_contract_code 保留映射表大小写，是生成源码时唯一可用的合约代码；contract_code 仅供识别且统一大写。不支持期权。",
+            "description": "离线识别境内六家期货交易所的期货合约。用户给出具体合约代码时，无论是否给出交易所都必须传 contract_code 查询；本轮上下文已有查询结果时直接使用，不要重复查询；给出交易所时核对返回交易所。用户给出品种和交割月份时传 product_name 与 month，可传 year、exchange_code 推导标准代码。CZCE 合约后缀为三位数字（一位年份加两位月份），其他交易所为四位数字。unrecognized 表示工具无法识别，不代表合约不存在；不得据此断言不存在。canonical_contract_code 保留映射表大小写，是生成源码时唯一可用的合约代码；contract_code 仅供识别且统一大写。不支持期权。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -319,6 +319,24 @@ def _contract_code_casing_error(
     return None
 
 
+_CONTRACT_CODE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])[A-Za-z]{1,8}[0-9]{3,4}(?![A-Za-z0-9])"
+)
+
+
+def _contract_codes_in_message(message: str) -> list[str]:
+    """Find contract-shaped identifiers that must be checked before answering."""
+    codes: list[str] = []
+    seen: set[str] = set()
+    for match in _CONTRACT_CODE_PATTERN.finditer(message):
+        code = match.group(0)
+        normalized = code.upper()
+        if normalized not in seen:
+            seen.add(normalized)
+            codes.append(code)
+    return codes
+
+
 def _coalesce_adjacent_turns(turns: Sequence[ChatTurn]) -> list[ChatTurn]:
     """Keep the chat role sequence valid when failed turns leave orphaned messages."""
     merged: list[ChatTurn] = []
@@ -408,6 +426,35 @@ class AgentRunner:
         generated_call_id = 0
         tool_failure_repair_pending = False
         validation = _ValidationState()
+        contract_codes = _contract_codes_in_message(message)
+        if contract_codes:
+            preflight_calls: list[AssistantToolCall] = []
+            preflight_results: list[ToolResultMessage] = []
+            for index, contract_code in enumerate(contract_codes):
+                call_id = f"agent_contract_lookup_{index}"
+                arguments = {"contract_code": contract_code}
+                result = lookup_exchange_by_contract_code(contract_code)
+                normalized_code = result.get("contract_code")
+                canonical_code = result.get("canonical_contract_code")
+                if isinstance(normalized_code, str) and isinstance(canonical_code, str):
+                    validation.canonical_contract_codes[normalized_code] = canonical_code
+                preflight_calls.append(
+                    AssistantToolCall(
+                        call_id,
+                        "lookup_exchange_by_contract_code",
+                        arguments,
+                    )
+                )
+                preflight_results.append(
+                    ToolResultMessage(
+                        json.dumps(result, ensure_ascii=False),
+                        call_id,
+                        "lookup_exchange_by_contract_code",
+                    )
+                )
+                used_call_ids.add(call_id)
+            messages.append(AssistantMessage("", tool_calls=tuple(preflight_calls)))
+            messages.extend(preflight_results)
         requirements = [*history, ChatTurn("user", message)]
         logger.info(
             "agent_turn_started conversation_id=%s model=%s max_tool_rounds=%d",
