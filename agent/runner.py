@@ -36,8 +36,8 @@ from agent.exchange_lookup import (
 from agent.prompt import build_system_prompt
 
 
-MAX_TOOL_ROUNDS = 12
-MAX_IDENTICAL_FAILED_TOOL_CALLS = 1
+MAX_TOOL_ROUNDS = 30
+MAX_IDENTICAL_FAILED_TOOL_CALLS = 3
 logger = logging.getLogger(__name__)
 TOOL_FAILURE_REPAIR_PROMPT = (
     "上一个工具结果包含 error 或 passed=false。请先检查该工具结果中的具体诊断，"
