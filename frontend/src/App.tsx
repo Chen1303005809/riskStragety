@@ -359,6 +359,7 @@ function MonitorDashboard({
                   <button className={conversation.conversation_id === selectedConversationId ? 'monitor-list-item selected' : 'monitor-list-item'} type="button" key={conversation.conversation_id} onClick={() => selectConversation(conversation.conversation_id)} aria-pressed={conversation.conversation_id === selectedConversationId}>
                     <strong>{conversation.title || '未命名会话'}</strong>
                     <span>{statusLabel(conversation.status)} · {conversation.message_count} 条消息 · {conversation.artifact_count} 个文件</span>
+                    <small className="monitor-session-id">会话 ID：<code>{conversation.conversation_id}</code></small>
                     <small>{displayTime(conversation.updated_at)}</small>
                   </button>
                 ))}
@@ -387,7 +388,16 @@ function MonitorDashboard({
               {selectedConversation && <button className="continue-button" type="button" onClick={() => onContinue(selectedAccountId, selectedConversation.conversation_id)}>在策略对话中继续</button>}
             </div>
             {detail ? <>
-              <div className="monitor-detail-meta"><strong>{detail.conversation.title || '未命名会话'}</strong><span>{statusLabel(detail.conversation.status)} · {detail.message_total} 条消息</span></div>
+              <div className="monitor-detail-meta">
+                <div className="monitor-detail-summary">
+                  <strong>{detail.conversation.title || '未命名会话'}</strong>
+                  <span>{statusLabel(detail.conversation.status)} · {detail.message_total} 条消息</span>
+                </div>
+                <div className="monitor-detail-session-id">
+                  <span>会话 ID</span>
+                  <code>{detail.conversation.conversation_id}</code>
+                </div>
+              </div>
               <div className="monitor-timeline">
                 {detail.messages.map((message) => (
                   <article className={'monitor-message monitor-message-' + message.role} key={message.id}>
