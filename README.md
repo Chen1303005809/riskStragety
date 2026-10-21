@@ -11,9 +11,11 @@
 | `agent/` | 原文迁移的系统提示词、按轮次添加上海日期、历史消息组织和有上限的工具调用循环。无 FastAPI 依赖。 |
 | `interfaces/价格接口/` | 从旧项目迁入的 Python 接口源码。Agent 可列出和读取，运行时不写入。 |
 | `artifacts/` | 生成的 Python 源码及迁移前遗留的 JSON 元数据。新产物归属和会话索引写入 SQLite。 |
-| `data/` | 默认 SQLite 数据库目录，保存账号、会话、消息、产物索引和 DeepSeek Key 配置；可由 `APP_DATA_DIR` 调整。 |
+| `data/` | 默认数据目录，保存账号、会话、消息、产物索引、DeepSeek Key 配置和会话交互日志；可由 `APP_DATA_DIR` 调整。 |
 
 `AgentRunner.run(...)` 是后端调用 Agent 的边界，返回异步业务事件。模型、接口读取和产物存储都经接口注入。共享 Bearer API Key 负责认证，账号 ID 负责数据归属，不是身份凭证；持有共享 Key 的调用方可以查看所有账号的监控数据。聊天时第一次使用的账号 ID（去除首尾空白后）和 UUID 会创建账号及会话，会话绑定账号且不能转移。服务端从 SQLite 恢复对话历史，并把用户消息、Agent 回复和文件关联持久化。网页的监控总览可浏览账号、会话、消息和生成文件。
+
+每个会话还会在 `APP_DATA_DIR/conversation_logs/<conversation_id>.jsonl`（默认 `data/conversation_logs/`）追加完整交互日志。日志包含每轮开始时的历史和用户消息、发送给主模型及功能检测模型的 system/user/assistant/tool 上下文、模型回复片段、工具调用参数与结果、沙盒用例和结果，以及完成、失败或中断状态。每条记录独立为一行 JSON；同一 `conversation_id` 续聊时追加到原文件。日志目录权限为 `0700`，文件权限为 `0600`。
 
 账号、会话和文件监控的实施路线见[真实账号与会话监控功能计划](docs/monitoring-feature-plan.md)。
 

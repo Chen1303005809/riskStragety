@@ -10,7 +10,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from agent.contracts import ChatTurn, ModelGateway, SystemMessage, ToolCall, UserMessage
+from agent.contracts import (
+    ChatTurn,
+    ConversationRecorder,
+    ModelGateway,
+    SystemMessage,
+    ToolCall,
+    UserMessage,
+)
 from agent.skills import SkillLoader
 
 
@@ -107,7 +114,20 @@ class SkillTestCaseBuilder:
         requirements: Sequence[ChatTurn],
         model: str,
         options: dict[str, int | float],
+        conversation_id: str | None = None,
+        turn_id: str | None = None,
+        conversation_recorder: ConversationRecorder | None = None,
     ) -> tuple[FunctionalTestCase, ...]:
+        async def record_trace(event: str, data: dict[str, Any]) -> None:
+            if (
+                conversation_recorder is not None
+                and conversation_id is not None
+                and turn_id is not None
+            ):
+                await conversation_recorder.record(
+                    conversation_id, turn_id, event, data
+                )
+
         skill = await self._skill_loader.load(TEST_CASE_SKILL_ID)
         request = {
             "conversation": [
@@ -125,6 +145,19 @@ class SkillTestCaseBuilder:
             "num_ctx": int(options.get("num_ctx", 16_384)),
         }
         calls: list[ToolCall] = []
+        await record_trace(
+            "functional_test_model_request",
+            {
+                "model": model,
+                "options": model_options,
+                "think": False,
+                "tools": [SUBMIT_TEST_CASES_SCHEMA],
+                "messages": [
+                    {"role": item.role, "content": item.content}
+                    for item in messages
+                ],
+            },
+        )
         try:
             async for chunk in self._model_gateway.stream_chat(
                 model,
@@ -133,11 +166,32 @@ class SkillTestCaseBuilder:
                 options=model_options,
                 think=False,
             ):
+                await record_trace(
+                    "functional_test_model_chunk",
+                    {
+                        "role": "assistant",
+                        "content": chunk.content,
+                        "reasoning_content": chunk.reasoning_content,
+                        "tool_calls": [
+                            {
+                                "name": call.name,
+                                "arguments": call.arguments,
+                                "call_id": call.call_id,
+                            }
+                            for call in chunk.tool_calls
+                        ],
+                        "usage": chunk.usage,
+                    },
+                )
                 calls.extend(chunk.tool_calls)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             detail = str(exc).strip() or f"{type(exc).__name__}（异常消息为空）"
+            await record_trace(
+                "functional_test_model_error",
+                {"exception_type": type(exc).__name__, "detail": detail},
+            )
             logger.exception(
                 "functional_test_case_builder_failed model=%s source_bytes=%d "
                 "exception_type=%s detail=%s",
@@ -150,7 +204,12 @@ class SkillTestCaseBuilder:
 
         if len(calls) != 1 or calls[0].name != "submit_test_cases":
             raise FunctionalTestError("测试用例 Skill 必须且只能提交一次 submit_test_cases")
-        return _parse_test_cases(calls[0].arguments)
+        cases = _parse_test_cases(calls[0].arguments)
+        await record_trace(
+            "functional_test_cases_built",
+            {"cases": [case.as_payload() for case in cases]},
+        )
+        return cases
 
 
 class SkillFunctionalTester:
@@ -165,6 +224,9 @@ class SkillFunctionalTester:
         requirements: Sequence[ChatTurn],
         model: str,
         options: dict[str, int | float],
+        conversation_id: str | None = None,
+        turn_id: str | None = None,
+        conversation_recorder: ConversationRecorder | None = None,
     ) -> dict[str, Any]:
         try:
             source_size = len(source.encode("utf-8"))
@@ -177,6 +239,9 @@ class SkillFunctionalTester:
             requirements=requirements,
             model=model,
             options=options,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            conversation_recorder=conversation_recorder,
         )
         logger.info(
             "functional_test_cases_built model=%s case_count=%d tick_count=%d",
@@ -187,6 +252,17 @@ class SkillFunctionalTester:
         try:
             results = await self._sandbox.run(source, cases)
         except Exception as exc:
+            if conversation_recorder is not None and conversation_id is not None and turn_id is not None:
+                await conversation_recorder.record(
+                    conversation_id,
+                    turn_id,
+                    "functional_sandbox_error",
+                    {
+                        "exception_type": type(exc).__name__,
+                        "detail": str(exc).strip()
+                        or f"{type(exc).__name__}（异常消息为空）",
+                    },
+                )
             logger.exception(
                 "functional_test_sandbox_failed model=%s case_count=%d "
                 "exception_type=%s detail=%s",
@@ -196,6 +272,13 @@ class SkillFunctionalTester:
                 (str(exc).strip() or f"{type(exc).__name__}（异常消息为空）")[:2_000],
             )
             raise
+        if conversation_recorder is not None and conversation_id is not None and turn_id is not None:
+            await conversation_recorder.record(
+                conversation_id,
+                turn_id,
+                "functional_sandbox_result",
+                {"cases": results},
+            )
         if not isinstance(results, list) or len(results) != len(cases):
             raise FunctionalTestError("沙盒返回的测试用例数量与提交数量不一致")
         for case, result in zip(cases, results):

@@ -19,6 +19,7 @@ from agent.contracts import (
     AssistantMessage,
     AssistantToolCall,
     ChatTurn,
+    ConversationRecorder,
     FunctionalTester,
     InterfaceReader,
     ModelGateway,
@@ -170,6 +171,42 @@ def _tool_call_signature_digest(name: str, arguments: dict[str, Any]) -> str:
     return hashlib.sha256(signature.encode("utf-8", errors="backslashreplace")).hexdigest()[:16]
 
 
+def _model_message_for_log(message: ModelMessage) -> dict[str, Any]:
+    """Serialize the exact provider-neutral message shape sent to a model."""
+    record: dict[str, Any] = {"role": message.role, "content": message.content}
+    if isinstance(message, AssistantMessage):
+        record["reasoning_content"] = message.reasoning_content
+        record["tool_calls"] = [
+            {
+                "call_id": call.call_id,
+                "name": call.name,
+                "arguments": call.arguments,
+            }
+            for call in message.tool_calls
+        ]
+    elif isinstance(message, ToolResultMessage):
+        record["call_id"] = message.call_id
+        record["tool_name"] = message.tool_name
+    return record
+
+
+def _model_chunk_for_log(chunk: ModelChunk) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": chunk.content,
+        "reasoning_content": chunk.reasoning_content,
+        "tool_calls": [
+            {
+                "call_id": call.call_id,
+                "name": call.name,
+                "arguments": call.arguments,
+            }
+            for call in chunk.tool_calls
+        ],
+        "usage": chunk.usage,
+    }
+
+
 def _exception_detail(exc: Exception) -> str:
     detail = str(exc).strip()
     return detail or f"{type(exc).__name__}（异常消息为空）"
@@ -315,9 +352,21 @@ class AgentRunner:
         model: str,
         account_id: str,
         conversation_id: str | None = None,
+        turn_id: str | None = None,
+        conversation_recorder: ConversationRecorder | None = None,
         options: dict[str, int | float] | None = None,
         think: bool = False,
     ) -> AsyncIterator[AgentEvent]:
+        async def record_trace(event: str, data: dict[str, Any]) -> None:
+            if (
+                conversation_recorder is not None
+                and conversation_id is not None
+                and turn_id is not None
+            ):
+                await conversation_recorder.record(
+                    conversation_id, turn_id, event, data
+                )
+
         model_options = options if options is not None else {
             "temperature": 0.3,
             "top_p": 0.8,
@@ -361,6 +410,17 @@ class AgentRunner:
             round_reasoning_content: list[str] = []
             calls: list[ToolCall] = []
             usage: dict[str, int] = {}
+            await record_trace(
+                "model_request",
+                {
+                    "round": round_index + 1,
+                    "model": model,
+                    "options": model_options,
+                    "think": think,
+                    "tools": TOOL_SCHEMAS,
+                    "messages": [_model_message_for_log(item) for item in messages],
+                },
+            )
             async for chunk in self._model.stream_chat(
                 model,
                 messages,
@@ -368,6 +428,10 @@ class AgentRunner:
                 options=model_options,
                 think=think,
             ):
+                await record_trace(
+                    "model_chunk",
+                    {"round": round_index + 1, **_model_chunk_for_log(chunk)},
+                )
                 if chunk.content:
                     round_content.append(chunk.content)
                     visible_content.append(chunk.content)
@@ -546,12 +610,24 @@ class AgentRunner:
                     sorted(call.arguments),
                     source_summary,
                 )
+                await record_trace(
+                    "tool_call_started",
+                    {
+                        "round": round_index + 1,
+                        "call_index": call_index,
+                        "call_id": call.call_id,
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    },
+                )
                 yield AgentEvent("status", {"phase": "tool_started", "tool": call.name})
                 try:
                     result, artifact = await self._call_tool(
                         call,
                         account_id,
                         conversation_id,
+                        turn_id=turn_id,
+                        conversation_recorder=conversation_recorder,
                         validation=validation,
                         requirements=requirements,
                         model=model,
@@ -571,6 +647,29 @@ class AgentRunner:
                         detail[:2_000],
                     )
                     result, artifact = {"error": detail}, None
+                except Exception as exc:
+                    await record_trace(
+                        "tool_result",
+                        {
+                            "round": round_index + 1,
+                            "call_index": call_index,
+                            "call_id": call.call_id,
+                            "name": call.name,
+                            "error": _exception_detail(exc),
+                            "exception_type": type(exc).__name__,
+                        },
+                    )
+                    raise
+                await record_trace(
+                    "tool_result",
+                    {
+                        "round": round_index + 1,
+                        "call_index": call_index,
+                        "call_id": call.call_id,
+                        "name": call.name,
+                        "result": result,
+                    },
+                )
                 if result.get("error") is not None or result.get("passed") is False:
                     tool_failure_repair_pending = True
                     failed_tool_call_counts[signature] = failure_count + 1
@@ -648,6 +747,8 @@ class AgentRunner:
         account_id: str,
         conversation_id: str | None,
         *,
+        turn_id: str | None,
+        conversation_recorder: ConversationRecorder | None,
         validation: _ValidationState,
         requirements: Sequence[ChatTurn],
         model: str,
@@ -717,12 +818,29 @@ class AgentRunner:
             if self._functional_tester is None:
                 raise ValueError("功能检测服务未配置，无法保存策略")
             try:
-                result = await self._functional_tester.run(
-                    source,
-                    requirements=requirements,
-                    model=model,
-                    options=options,
+                tester_run = self._functional_tester.run
+                run_kwargs: dict[str, Any] = {
+                    "requirements": requirements,
+                    "model": model,
+                    "options": options,
+                }
+                try:
+                    parameters = inspect.signature(tester_run).parameters
+                except (TypeError, ValueError):
+                    parameters = {}
+                accepts_extra_keywords = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
                 )
+                optional_trace_args = {
+                    "conversation_id": conversation_id,
+                    "turn_id": turn_id,
+                    "conversation_recorder": conversation_recorder,
+                }
+                for name, value in optional_trace_args.items():
+                    if name in parameters or accepts_extra_keywords:
+                        run_kwargs[name] = value
+                result = await tester_run(source, **run_kwargs)
             except (ValueError, OSError):
                 validation.functional_passed.discard(digest)
                 raise

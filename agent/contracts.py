@@ -132,3 +132,15 @@ class FunctionalTester(Protocol):
         model: str,
         options: dict[str, int | float],
     ) -> dict[str, Any]: ...
+
+
+class ConversationRecorder(Protocol):
+    async def record(
+        self,
+        conversation_id: str,
+        turn_id: str,
+        event: str,
+        data: dict[str, Any],
+        *,
+        flush: bool = False,
+    ) -> None: ...

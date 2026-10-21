@@ -22,6 +22,7 @@ from agent.contracts import AgentEvent, ChatTurn, FunctionalTester, ModelGateway
 from agent.functional_tests import SkillFunctionalTester, SkillTestCaseBuilder
 from agent.runner import AgentRunner
 from agent.skills import FilesystemSkillLoader
+from backend.adapters.conversation_logs import ConversationLogStore
 from backend.adapters.files import IndexedArtifactWriter, LocalArtifactStore, LocalInterfaceReader
 from backend.adapters.provider_settings import ProviderSettingsStore
 from backend.adapters.monitoring import (
@@ -151,6 +152,7 @@ def create_app(
     model = model_gateway or OllamaModelGateway(config.ollama_base_url)
     artifacts = artifact_store or LocalArtifactStore(config.project_root / "artifacts")
     monitoring = MonitoringStore(config.data_dir / "monitoring.sqlite3", artifacts.directory)
+    conversation_logs = ConversationLogStore(config.data_dir / "conversation_logs")
     provider_settings = ProviderSettingsStore(config.data_dir / "provider_settings.sqlite3")
     interface_directory = config.project_root / "interfaces" / "价格接口"
     interfaces = LocalInterfaceReader(interface_directory)
@@ -181,6 +183,7 @@ def create_app(
     app = FastAPI(title="风控策略 Agent", lifespan=lifespan)
     app.state.settings = config
     app.state.monitoring = monitoring
+    app.state.conversation_logs = conversation_logs
     app.state.provider_settings = provider_settings
 
     @app.exception_handler(MappedHTTPException)
@@ -316,18 +319,38 @@ def create_app(
             assistant_message_id: int | None = None
             turn_finalized = False
 
-            async def finalize_failed_turn(content: str) -> None:
+            async def finalize_failed_turn(
+                content: str,
+                *,
+                status: str = "failed",
+                details: dict[str, object] | None = None,
+            ) -> None:
                 nonlocal turn_finalized
                 if assistant_message_id is None or turn_finalized:
                     return
                 try:
-                    await monitoring.finish_turn(
-                        conversation_id, assistant_message_id, content, "failed"
+                    await conversation_logs.record(
+                        conversation_id,
+                        str(assistant_message_id),
+                        "turn_finished",
+                        {"status": status, "content": content, **(details or {})},
+                        flush=True,
                     )
                 except Exception:
                     logger.exception(
-                        "agent_failed_turn_persistence_failed conversation_id=%s",
+                        "conversation_log_finish_failed conversation_id=%s turn_id=%s",
                         conversation_id,
+                        assistant_message_id,
+                    )
+                try:
+                    await monitoring.finish_turn(
+                        conversation_id, assistant_message_id, content, status
+                    )
+                except Exception:
+                    logger.exception(
+                        "agent_turn_persistence_failed conversation_id=%s status=%s",
+                        conversation_id,
+                        status,
                     )
                 turn_finalized = True
 
@@ -343,12 +366,31 @@ def create_app(
                         payload.account_id, conversation_id, payload.message
                     )
                     history = [ChatTurn(role, content) for role, content in history_rows]
+                    await conversation_logs.record(
+                        conversation_id,
+                        str(assistant_message_id),
+                        "turn_started",
+                        {
+                            "account_id": payload.account_id,
+                            "provider": payload.provider,
+                            "model": selected_model,
+                            "options": payload.options.model_dump(),
+                            "think": payload.think,
+                            "history": [
+                                {"role": turn.role, "content": turn.content}
+                                for turn in history
+                            ],
+                            "user_message": payload.message,
+                        },
+                    )
                     async for event in selected_runner.run(
                         message=payload.message,
                         history=history,
                         model=selected_model,
                         account_id=payload.account_id,
                         conversation_id=conversation_id,
+                        turn_id=str(assistant_message_id),
+                        conversation_recorder=conversation_logs,
                         options=payload.options.model_dump(),
                         think=payload.think,
                     ):
@@ -372,6 +414,21 @@ def create_app(
                                     "ErrMsg": err_msg,
                                 },
                             )
+                            await conversation_logs.record(
+                                conversation_id,
+                                str(assistant_message_id),
+                                "turn_finished",
+                                {
+                                    "status": "complete",
+                                    "content": "".join(partial_content),
+                                    "model": selected_model,
+                                    "artifacts": artifacts_data or [],
+                                    "usage": event.data.get("usage", {}),
+                                    "ErrCode": err_code,
+                                    "ErrMsg": err_msg,
+                                },
+                                flush=True,
+                            )
                             await monitoring.finish_turn(
                                 conversation_id,
                                 assistant_message_id,
@@ -391,7 +448,10 @@ def create_app(
                                 len("".join(partial_content)),
                                 json.dumps(event.data, ensure_ascii=False, default=str)[:2_000],
                             )
-                            await finalize_failed_turn("".join(partial_content))
+                            await finalize_failed_turn(
+                                "".join(partial_content),
+                                details={"error": event.data},
+                            )
                             yield _sse(
                                 AgentEvent(
                                     "error",
@@ -413,7 +473,10 @@ def create_app(
                         selected_model,
                         len("".join(partial_content)),
                     )
-                    await finalize_failed_turn("".join(partial_content))
+                    await finalize_failed_turn(
+                        "".join(partial_content),
+                        details={"error": "agent_incomplete"},
+                    )
                     yield _sse(
                         AgentEvent(
                             "error",
@@ -432,15 +495,11 @@ def create_app(
                     selected_model,
                 )
                 if assistant_message_id is not None and not turn_finalized:
-                    try:
-                        await monitoring.finish_turn(
-                            conversation_id,
-                            assistant_message_id,
-                            "".join(partial_content),
-                            "interrupted",
-                        )
-                    finally:
-                        turn_finalized = True
+                    await finalize_failed_turn(
+                        "".join(partial_content),
+                        status="interrupted",
+                        details={"error": "request_cancelled"},
+                    )
                 raise
             except Exception as exc:
                 exception_detail = str(exc).strip() or (
@@ -469,7 +528,14 @@ def create_app(
                         failed_content = f"{failed_content}\n\n{failure_context}"
                     else:
                         failed_content = failure_context
-                    await finalize_failed_turn(failed_content)
+                    await finalize_failed_turn(
+                        failed_content,
+                        details={
+                            "error": exception_detail,
+                            "exception_type": type(exc).__name__,
+                            "failure_context": failure_context,
+                        },
+                    )
                 yield _sse(
                     AgentEvent(
                         "error",
