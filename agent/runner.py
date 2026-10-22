@@ -38,8 +38,6 @@ from agent.prompt import build_system_prompt
 
 MAX_TOOL_ROUNDS = 30
 MAX_IDENTICAL_FAILED_TOOL_RETRIES = 3
-FUNCTIONAL_RETRY_TEMPERATURE_INCREMENT = 0.1
-MAX_MODEL_TEMPERATURE = 1.0
 logger = logging.getLogger(__name__)
 TOOL_FAILURE_REPAIR_PROMPT = (
     "上一个工具结果包含 error 或 passed=false。请先检查该工具结果中的具体诊断，"
@@ -50,6 +48,13 @@ TOOL_FAILURE_REPAIR_PROMPT = (
     "保留已通过用例的行为，不得修改测试预期。功能检测失败且源码有修改时，"
     "先重新调用 check_python_syntax，通过后再调用 run_functional_test。"
     "不要只向用户描述失败，也不要保存未通过检测的源码。"
+)
+UNCHANGED_SOURCE_REPAIR_PROMPT = (
+    "你刚刚提交的源码与失败版本具有相同的 Python 语法树，说明没有修改实现逻辑；"
+    "上面的测试结果是复用的，没有重新运行沙盒。现在必须直接修复代码：先按 failed_cases 中"
+    "每个 tick 的顺序追踪相关状态变量，再指出实际出错的判断或状态转换，并据此修改源码。"
+    "不要改测试预期，也不要只加注释、改空白或改变量名。修改后先调用 check_python_syntax，"
+    "通过后再调用 run_functional_test。"
 )
 CONTRACT_LOOKUP_PREFLIGHT_PROMPT = """你负责为本轮期货策略请求预查询品种、合约和交易所信息。
 只检查当前请求及仍与当前请求相关的上下文。对用户明确给出的每个具体期货合约代码，调用 lookup_exchange_by_contract_code 并传 contract_code；对用户明确给出的品种和交割月份，调用该工具并传 product_name 与 month，显式年份和交易所一并传入。不得猜测合约代码、交割月份、年份或交易所。只有品种但没有月份或具体代码时，不调用工具。
@@ -108,7 +113,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_functional_test",
-            "description": "按用户规则构造测试用例并在隔离沙盒中运行候选策略；必须先通过 check_python_syntax。失败时返回 failed_source（本次实际测试的完整源码）及失败用例诊断。",
+            "description": "按用户规则构造测试用例并在隔离沙盒中运行候选策略；必须先通过 check_python_syntax。此前失败版本的 Python 语法树相同则复用上次失败用例，不重复运行沙盒，并要求先修改实现逻辑。失败时返回 failed_source（本次实际测试的完整源码）及失败用例诊断。",
             "parameters": {
                 "type": "object",
                 "properties": {"source": {"type": "string", "description": "通过语法检查的完整 Python 源码"}},
@@ -192,6 +197,16 @@ class _ValidationState:
 
 def _source_digest(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _source_behavior_digest(source: str) -> str:
+    """Hash Python syntax while ignoring comments and formatting-only changes."""
+    try:
+        tree = ast.parse(source, feature_version=(3, 7))
+    except SyntaxError:
+        return _source_digest(source)
+    normalized = ast.dump(tree, annotate_fields=True, include_attributes=False)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _source_digest_for_log(source: str) -> str:
@@ -424,8 +439,10 @@ class AgentRunner:
         used_call_ids: set[str] = set()
         generated_call_id = 0
         tool_failure_repair_pending = False
-        temperature_boost_pending = False
-        temperature_boost_steps = 0
+        functional_repair_mode = any(
+            turn.role == "assistant" and "【上轮失败诊断】" in turn.content
+            for turn in history
+        )
         validation = _ValidationState()
         requirements = [*history, ChatTurn("user", message)]
         logger.info(
@@ -520,26 +537,20 @@ class AgentRunner:
 
         for round_index in range(self._max_tool_rounds + 1):
             round_options = model_options
-            if temperature_boost_pending:
-                base_temperature = float(model_options.get("temperature", 0.3))
-                adjusted_temperature = min(
-                    base_temperature
-                    + temperature_boost_steps * FUNCTIONAL_RETRY_TEMPERATURE_INCREMENT,
-                    MAX_MODEL_TEMPERATURE,
-                )
+            qwen38_repair_mode = (
+                model.casefold().startswith("qwen3.8") and functional_repair_mode
+            )
+            round_think = think or qwen38_repair_mode
+            if qwen38_repair_mode and not think:
                 round_options = {
                     **model_options,
-                    "temperature": adjusted_temperature,
+                    "temperature": 1.0,
+                    "top_p": 0.95,
+                    "top_k": 20,
+                    "min_p": 0.0,
+                    "presence_penalty": 0.0,
+                    "repeat_penalty": 1.0,
                 }
-                logger.info(
-                    "agent_retry_temperature_adjusted conversation_id=%s model=%s "
-                    "round=%d base_temperature=%s adjusted_temperature=%s",
-                    conversation_id or "-",
-                    model,
-                    round_index + 1,
-                    base_temperature,
-                    adjusted_temperature,
-                )
             logger.info(
                 "agent_model_round_started conversation_id=%s model=%s round=%d",
                 conversation_id or "-",
@@ -556,7 +567,7 @@ class AgentRunner:
                     "round": round_index + 1,
                     "model": model,
                     "options": round_options,
-                    "think": think,
+                    "think": round_think,
                     "tools": TOOL_SCHEMAS,
                     "messages": [_model_message_for_log(item) for item in messages],
                 },
@@ -566,7 +577,7 @@ class AgentRunner:
                 messages,
                 TOOL_SCHEMAS,
                 options=round_options,
-                think=think,
+                think=round_think,
             ):
                 await record_trace(
                     "model_chunk",
@@ -592,13 +603,6 @@ class AgentRunner:
                 [call.name for call in calls],
                 usage,
             )
-
-            if temperature_boost_pending and any(
-                call.name in {"check_python_syntax", "run_functional_test"}
-                and isinstance(call.arguments.get("source"), str)
-                for call in calls
-            ):
-                temperature_boost_pending = False
 
             if "".join(round_content).lstrip().startswith("【参数补充请求】"):
                 if created:
@@ -711,13 +715,14 @@ class AgentRunner:
                 )
             )
             tool_failure_repair_pending = False
+            unchanged_source_replayed_this_round = False
             for call_index, call in enumerate(resolved_calls, start=1):
                 signature = _tool_call_signature(call.name, call.arguments)
                 failure_count = failed_tool_call_counts.get(signature, 0)
                 source = call.arguments.get("source")
                 previous_failure: dict[str, Any] | None = None
                 if call.name == "run_functional_test" and isinstance(source, str):
-                    source_digest = _source_digest(source)
+                    source_digest = _source_behavior_digest(source)
                     previous_failure = validation.failed_functional_sources.get(
                         source_digest
                     )
@@ -780,9 +785,8 @@ class AgentRunner:
                 )
                 yield AgentEvent("status", {"phase": "tool_started", "tool": call.name})
                 try:
-                    if previous_failure is not None and isinstance(source, str):
-                        temperature_boost_pending = True
-                        temperature_boost_steps += 1
+                    if call.name == "run_functional_test" and previous_failure is not None:
+                        unchanged_source_replayed_this_round = True
                         await record_trace(
                             "tool_call_blocked",
                             {
@@ -790,16 +794,17 @@ class AgentRunner:
                                 "call_index": call_index,
                                 "call_id": call.call_id,
                                 "name": call.name,
-                                "reason": "unchanged_source_replayed_failure",
+                                "reason": "unchanged_failed_source_reuses_diagnostics",
                                 "source_sha256": _source_digest(source),
+                                "behavior_sha256": _source_behavior_digest(source),
                             },
                         )
                         result = {
                             **previous_failure,
                             "failed_source": source,
                             "repeat_notice": (
-                                "候选源码与此前失败版本完全相同，本次未重复运行沙盒，"
-                                "已复用上次失败用例。请修改实现逻辑后再检查和测试。"
+                                "源码语法树与此前失败版本相同，本次未重新运行沙盒；"
+                                "请按失败用例修改实现逻辑后再测试。"
                             ),
                         }
                         artifact = None
@@ -857,14 +862,20 @@ class AgentRunner:
                 )
                 if result.get("error") is not None or result.get("passed") is False:
                     tool_failure_repair_pending = True
-                    failed_tool_call_counts[signature] = failure_count + 1
+                    if call.name == "run_functional_test":
+                        functional_repair_mode = True
+                    if not (
+                        call.name == "run_functional_test"
+                        and previous_failure is not None
+                    ):
+                        failed_tool_call_counts[signature] = failure_count + 1
                     if (
                         call.name == "run_functional_test"
                         and result.get("passed") is False
                         and isinstance(source, str)
                     ):
                         validation.failed_functional_sources.setdefault(
-                            _source_digest(source),
+                            _source_behavior_digest(source),
                             _functional_failure_summary(result),
                         )
                     logger.warning(
@@ -919,7 +930,10 @@ class AgentRunner:
                 yield AgentEvent("status", {"phase": "tool_finished", "tool": call.name})
 
             if tool_failure_repair_pending:
-                messages.append(UserMessage(TOOL_FAILURE_REPAIR_PROMPT))
+                repair_prompt = TOOL_FAILURE_REPAIR_PROMPT
+                if unchanged_source_replayed_this_round:
+                    repair_prompt += "\n\n" + UNCHANGED_SOURCE_REPAIR_PROMPT
+                messages.append(UserMessage(repair_prompt))
 
         message = "Agent 未能完成请求"
         logger.error(
