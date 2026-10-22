@@ -37,12 +37,15 @@ from agent.prompt import build_system_prompt
 
 
 MAX_TOOL_ROUNDS = 30
-MAX_IDENTICAL_FAILED_TOOL_CALLS = 3
+MAX_IDENTICAL_FAILED_TOOL_RETRIES = 3
+FUNCTIONAL_RETRY_TEMPERATURE_INCREMENT = 0.1
+MAX_MODEL_TEMPERATURE = 1.0
 logger = logging.getLogger(__name__)
 TOOL_FAILURE_REPAIR_PROMPT = (
     "上一个工具结果包含 error 或 passed=false。请先检查该工具结果中的具体诊断，"
     "功能检测失败时，以结果中的 failed_source 作为被测源码，直接修改它来修复失败原因；"
-    "不得原样返回失败源码或对完全相同的参数再次调用失败的工具。"
+    "若工具结果提示复用了之前的失败诊断，说明源码没有变化；必须先修改实现逻辑，"
+    "不得只改注释或空白后重试，也不得原样返回失败源码。"
     "若功能检测结果包含 failed_cases，逐笔按其中的 ticks 推演源码状态变化，"
     "保留已通过用例的行为，不得修改测试预期。功能检测失败且源码有修改时，"
     "先重新调用 check_python_syntax，通过后再调用 run_functional_test。"
@@ -157,10 +160,26 @@ def _tool_failure_context_entry(name: str, result: dict[str, Any]) -> str:
         if isinstance(failed_cases, list):
             details["failed_cases"] = failed_cases
         error = result.get("error")
+        if error is None:
+            error = result.get("repeat_notice")
         if error is not None:
             details["error"] = str(error)
         result = details
     return f"{name}: {json.dumps(result, ensure_ascii=False)}"
+
+
+def _functional_failure_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep only the useful diagnostics for replaying a failed source."""
+    summary: dict[str, Any] = {"passed": False}
+    if "case_count" in result:
+        summary["case_count"] = result["case_count"]
+    failed_cases = result.get("failed_cases")
+    if isinstance(failed_cases, list):
+        summary["failed_cases"] = failed_cases
+    error = result.get("error")
+    if error is not None:
+        summary["error"] = str(error)
+    return summary
 
 
 @dataclass
@@ -168,7 +187,7 @@ class _ValidationState:
     syntax_passed: set[str] = field(default_factory=set)
     functional_passed: set[str] = field(default_factory=set)
     canonical_contract_codes: dict[str, str] = field(default_factory=dict)
-    failed_functional_sources: dict[str, str] = field(default_factory=dict)
+    failed_functional_sources: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _source_digest(source: str) -> str:
@@ -405,6 +424,8 @@ class AgentRunner:
         used_call_ids: set[str] = set()
         generated_call_id = 0
         tool_failure_repair_pending = False
+        temperature_boost_pending = False
+        temperature_boost_steps = 0
         validation = _ValidationState()
         requirements = [*history, ChatTurn("user", message)]
         logger.info(
@@ -498,6 +519,27 @@ class AgentRunner:
         )
 
         for round_index in range(self._max_tool_rounds + 1):
+            round_options = model_options
+            if temperature_boost_pending:
+                base_temperature = float(model_options.get("temperature", 0.3))
+                adjusted_temperature = min(
+                    base_temperature
+                    + temperature_boost_steps * FUNCTIONAL_RETRY_TEMPERATURE_INCREMENT,
+                    MAX_MODEL_TEMPERATURE,
+                )
+                round_options = {
+                    **model_options,
+                    "temperature": adjusted_temperature,
+                }
+                logger.info(
+                    "agent_retry_temperature_adjusted conversation_id=%s model=%s "
+                    "round=%d base_temperature=%s adjusted_temperature=%s",
+                    conversation_id or "-",
+                    model,
+                    round_index + 1,
+                    base_temperature,
+                    adjusted_temperature,
+                )
             logger.info(
                 "agent_model_round_started conversation_id=%s model=%s round=%d",
                 conversation_id or "-",
@@ -513,7 +555,7 @@ class AgentRunner:
                 {
                     "round": round_index + 1,
                     "model": model,
-                    "options": model_options,
+                    "options": round_options,
                     "think": think,
                     "tools": TOOL_SCHEMAS,
                     "messages": [_model_message_for_log(item) for item in messages],
@@ -523,7 +565,7 @@ class AgentRunner:
                 model,
                 messages,
                 TOOL_SCHEMAS,
-                options=model_options,
+                options=round_options,
                 think=think,
             ):
                 await record_trace(
@@ -550,6 +592,13 @@ class AgentRunner:
                 [call.name for call in calls],
                 usage,
             )
+
+            if temperature_boost_pending and any(
+                call.name in {"check_python_syntax", "run_functional_test"}
+                and isinstance(call.arguments.get("source"), str)
+                for call in calls
+            ):
+                temperature_boost_pending = False
 
             if "".join(round_content).lstrip().startswith("【参数补充请求】"):
                 if created:
@@ -666,53 +715,25 @@ class AgentRunner:
                 signature = _tool_call_signature(call.name, call.arguments)
                 failure_count = failed_tool_call_counts.get(signature, 0)
                 source = call.arguments.get("source")
+                previous_failure: dict[str, Any] | None = None
                 if call.name == "run_functional_test" and isinstance(source, str):
                     source_digest = _source_digest(source)
                     previous_failure = validation.failed_functional_sources.get(
                         source_digest
                     )
-                    if previous_failure is not None:
-                        message = (
-                            "功能检测未重复执行：候选源码与此前失败版本完全相同。"
-                            "请修改源码后重新检查；此前失败用例已附在诊断中。"
-                        )
-                        logger.warning(
-                            "agent_unchanged_failed_functional_source_stopped "
-                            "conversation_id=%s model=%s round=%d call=%d "
-                            "source_sha256=%s",
-                            conversation_id or "-",
-                            model,
-                            round_index + 1,
-                            call_index,
-                            source_digest[:16],
-                        )
-                        await record_trace(
-                            "tool_call_blocked",
-                            {
-                                "round": round_index + 1,
-                                "call_index": call_index,
-                                "call_id": call.call_id,
-                                "name": call.name,
-                                "reason": "unchanged_source_after_functional_failure",
-                                "source_sha256": source_digest,
-                            },
-                        )
-                        raise AgentError(
-                            message,
-                            failure_context=_failure_context(
-                                message, [previous_failure]
-                            ),
-                        )
 
-                if failure_count >= MAX_IDENTICAL_FAILED_TOOL_CALLS:
+                if failure_count > MAX_IDENTICAL_FAILED_TOOL_RETRIES:
+                    retry_count = failure_count - 1
                     message = (
                         f"模型在第 {round_index + 1} 轮第 {call_index} 个工具调用中，"
-                        f"对工具 {call.name} 使用相同参数再次调用；此前已失败 {failure_count} 次，"
+                        f"对工具 {call.name} 使用相同参数再次调用；此前已连续重试 "
+                        f"{retry_count} 次，达到 {MAX_IDENTICAL_FAILED_TOOL_RETRIES} 次上限，"
                         "已停止重复调用"
                     )
                     logger.error(
                         "agent_repeated_failed_tool_call_stopped conversation_id=%s model=%s "
-                        "round=%d call=%d tool=%s signature_sha256=%s previous_failures=%d",
+                        "round=%d call=%d tool=%s signature_sha256=%s "
+                        "previous_failures=%d retry_limit=%d",
                         conversation_id or "-",
                         model,
                         round_index + 1,
@@ -720,6 +741,7 @@ class AgentRunner:
                         call.name,
                         _tool_call_signature_digest(call.name, call.arguments),
                         failure_count,
+                        MAX_IDENTICAL_FAILED_TOOL_RETRIES,
                     )
                     raise AgentError(
                         message,
@@ -758,17 +780,41 @@ class AgentRunner:
                 )
                 yield AgentEvent("status", {"phase": "tool_started", "tool": call.name})
                 try:
-                    result, artifact = await self._call_tool(
-                        call,
-                        account_id,
-                        conversation_id,
-                        turn_id=turn_id,
-                        conversation_recorder=conversation_recorder,
-                        validation=validation,
-                        requirements=requirements,
-                        model=model,
-                        options=model_options,
-                    )
+                    if previous_failure is not None and isinstance(source, str):
+                        temperature_boost_pending = True
+                        temperature_boost_steps += 1
+                        await record_trace(
+                            "tool_call_blocked",
+                            {
+                                "round": round_index + 1,
+                                "call_index": call_index,
+                                "call_id": call.call_id,
+                                "name": call.name,
+                                "reason": "unchanged_source_replayed_failure",
+                                "source_sha256": _source_digest(source),
+                            },
+                        )
+                        result = {
+                            **previous_failure,
+                            "failed_source": source,
+                            "repeat_notice": (
+                                "候选源码与此前失败版本完全相同，本次未重复运行沙盒，"
+                                "已复用上次失败用例。请修改实现逻辑后再检查和测试。"
+                            ),
+                        }
+                        artifact = None
+                    else:
+                        result, artifact = await self._call_tool(
+                            call,
+                            account_id,
+                            conversation_id,
+                            turn_id=turn_id,
+                            conversation_recorder=conversation_recorder,
+                            validation=validation,
+                            requirements=requirements,
+                            model=model,
+                            options=model_options,
+                        )
                 except (ValueError, OSError) as exc:
                     detail = _exception_detail(exc)
                     logger.warning(
@@ -817,9 +863,10 @@ class AgentRunner:
                         and result.get("passed") is False
                         and isinstance(source, str)
                     ):
-                        validation.failed_functional_sources[
-                            _source_digest(source)
-                        ] = _tool_failure_context_entry(call.name, result)
+                        validation.failed_functional_sources.setdefault(
+                            _source_digest(source),
+                            _functional_failure_summary(result),
+                        )
                     logger.warning(
                         "agent_tool_failed conversation_id=%s model=%s round=%d call=%d/%d "
                         "tool=%s signature_sha256=%s%s result=%s",
