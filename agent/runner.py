@@ -47,12 +47,15 @@ TOOL_FAILURE_REPAIR_PROMPT = (
     "先重新调用 check_python_syntax，通过后再调用 run_functional_test。"
     "不要只向用户描述失败，也不要保存未通过检测的源码。"
 )
+CONTRACT_LOOKUP_PREFLIGHT_PROMPT = """你负责为本轮期货策略请求预查询品种、合约和交易所信息。
+只检查当前请求及仍与当前请求相关的上下文。对用户明确给出的每个具体期货合约代码，调用 lookup_exchange_by_contract_code 并传 contract_code；对用户明确给出的品种和交割月份，调用该工具并传 product_name 与 month，显式年份和交易所一并传入。不得猜测合约代码、交割月份、年份或交易所。只有品种但没有月份或具体代码时，不调用工具。
+本次请求只用于调用查询工具，不要向用户回复文字；多个品种可在本次模型请求中分别调用工具。"""
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "lookup_exchange_by_contract_code",
-            "description": "离线识别境内六家期货交易所的期货合约。用户给出具体合约代码时，无论是否给出交易所都必须传 contract_code 查询；本轮上下文已有查询结果时直接使用，不要重复查询；给出交易所时核对返回交易所。用户给出品种和交割月份时传 product_name 与 month，可传 year、exchange_code 推导标准代码。CZCE 合约后缀为三位数字（一位年份加两位月份），其他交易所为四位数字。unrecognized 表示工具无法识别，不代表合约不存在；不得据此断言不存在。canonical_contract_code 保留映射表大小写，是生成源码时唯一可用的合约代码；contract_code 仅供识别且统一大写。不支持期权。",
+            "description": "离线识别境内六家期货交易所的期货合约。用户给出具体合约代码时，无论是否给出交易所都传 contract_code 查询；用户给出品种和交割月份时传 product_name 与 month，可传 year、exchange_code 推导标准代码。若本轮系统提示已包含对应合约或品种月份的预查询结果，直接使用且不要重复查询；给出交易所时核对返回交易所。CZCE 合约后缀为三位数字（一位年份加两位月份），其他交易所为四位数字。unrecognized 表示工具无法识别，不代表合约不存在；不得据此断言不存在。canonical_contract_code 保留映射表大小写，是生成源码时唯一可用的合约代码；contract_code 仅供识别且统一大写。不支持期权。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -319,24 +322,6 @@ def _contract_code_casing_error(
     return None
 
 
-_CONTRACT_CODE_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])[A-Za-z]{1,8}[0-9]{3,4}(?![A-Za-z0-9])"
-)
-
-
-def _contract_codes_in_message(message: str) -> list[str]:
-    """Find contract-shaped identifiers that must be checked before answering."""
-    codes: list[str] = []
-    seen: set[str] = set()
-    for match in _CONTRACT_CODE_PATTERN.finditer(message):
-        code = match.group(0)
-        normalized = code.upper()
-        if normalized not in seen:
-            seen.add(normalized)
-            codes.append(code)
-    return codes
-
-
 def _coalesce_adjacent_turns(turns: Sequence[ChatTurn]) -> list[ChatTurn]:
     """Keep the chat role sequence valid when failed turns leave orphaned messages."""
     merged: list[ChatTurn] = []
@@ -411,13 +396,6 @@ class AgentRunner:
         conversation_turns = _coalesce_adjacent_turns(
             [*history, ChatTurn("user", message)]
         )
-        messages: list[ModelMessage] = [SystemMessage(build_system_prompt())]
-        messages.extend(
-            UserMessage(turn.content)
-            if turn.role == "user"
-            else AssistantMessage(turn.content)
-            for turn in conversation_turns
-        )
         visible_content: list[str] = []
         created: list[Artifact] = []
         tool_failures: list[str] = []
@@ -426,35 +404,6 @@ class AgentRunner:
         generated_call_id = 0
         tool_failure_repair_pending = False
         validation = _ValidationState()
-        contract_codes = _contract_codes_in_message(message)
-        if contract_codes:
-            preflight_calls: list[AssistantToolCall] = []
-            preflight_results: list[ToolResultMessage] = []
-            for index, contract_code in enumerate(contract_codes):
-                call_id = f"agent_contract_lookup_{index}"
-                arguments = {"contract_code": contract_code}
-                result = lookup_exchange_by_contract_code(contract_code)
-                normalized_code = result.get("contract_code")
-                canonical_code = result.get("canonical_contract_code")
-                if isinstance(normalized_code, str) and isinstance(canonical_code, str):
-                    validation.canonical_contract_codes[normalized_code] = canonical_code
-                preflight_calls.append(
-                    AssistantToolCall(
-                        call_id,
-                        "lookup_exchange_by_contract_code",
-                        arguments,
-                    )
-                )
-                preflight_results.append(
-                    ToolResultMessage(
-                        json.dumps(result, ensure_ascii=False),
-                        call_id,
-                        "lookup_exchange_by_contract_code",
-                    )
-                )
-                used_call_ids.add(call_id)
-            messages.append(AssistantMessage("", tool_calls=tuple(preflight_calls)))
-            messages.extend(preflight_results)
         requirements = [*history, ChatTurn("user", message)]
         logger.info(
             "agent_turn_started conversation_id=%s model=%s max_tool_rounds=%d",
@@ -463,6 +412,88 @@ class AgentRunner:
             self._max_tool_rounds,
         )
         yield AgentEvent("status", {"phase": "started", "model": model})
+
+        preflight_messages: list[ModelMessage] = [
+            SystemMessage(CONTRACT_LOOKUP_PREFLIGHT_PROMPT)
+        ]
+        preflight_messages.extend(
+            UserMessage(turn.content)
+            if turn.role == "user"
+            else AssistantMessage(turn.content)
+            for turn in conversation_turns
+        )
+        lookup_tools = [TOOL_SCHEMAS[0]]
+        await record_trace(
+            "model_request",
+            {
+                "phase": "contract_lookup_preflight",
+                "model": model,
+                "options": model_options,
+                "think": think,
+                "tools": lookup_tools,
+                "messages": [_model_message_for_log(item) for item in preflight_messages],
+            },
+        )
+        preflight_calls: list[ToolCall] = []
+        async for chunk in self._model.stream_chat(
+            model,
+            preflight_messages,
+            lookup_tools,
+            options=model_options,
+            think=think,
+        ):
+            await record_trace(
+                "model_chunk",
+                {"phase": "contract_lookup_preflight", **_model_chunk_for_log(chunk)},
+            )
+            preflight_calls.extend(chunk.tool_calls)
+
+        contract_lookup_results: list[dict[str, Any]] = []
+        for index, tool_call in enumerate(preflight_calls):
+            if tool_call.name != "lookup_exchange_by_contract_code":
+                continue
+            call_id = tool_call.call_id or f"agent_preflight_lookup_{index}"
+            call = AssistantToolCall(call_id, tool_call.name, tool_call.arguments)
+            try:
+                result, _ = await self._call_tool(
+                    call,
+                    account_id,
+                    conversation_id,
+                    turn_id=turn_id,
+                    conversation_recorder=conversation_recorder,
+                    validation=validation,
+                    requirements=requirements,
+                    model=model,
+                    options=model_options,
+                )
+            except (ValueError, OSError) as exc:
+                result = {"error": _exception_detail(exc)}
+            contract_lookup_results.append(
+                {"arguments": tool_call.arguments, "result": result}
+            )
+            await record_trace(
+                "contract_lookup_preflight_result",
+                {
+                    "call_id": call_id,
+                    "arguments": tool_call.arguments,
+                    "result": result,
+                },
+            )
+
+        contract_context = (
+            json.dumps(contract_lookup_results, ensure_ascii=False, indent=2)
+            if contract_lookup_results
+            else "未取得查询结果；正式会话需按实际需求继续查询或询问缺失信息。"
+        )
+        messages: list[ModelMessage] = [
+            SystemMessage(build_system_prompt(contract_context=contract_context))
+        ]
+        messages.extend(
+            UserMessage(turn.content)
+            if turn.role == "user"
+            else AssistantMessage(turn.content)
+            for turn in conversation_turns
+        )
 
         for round_index in range(self._max_tool_rounds + 1):
             logger.info(

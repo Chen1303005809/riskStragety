@@ -12,8 +12,8 @@ TOOL_INSTRUCTIONS = """# 工具执行规则
 - 用户明确要求生成、重新生成或重做策略，或要求给现有策略增加/修改业务规则时，必须把历史中已确认的需求与本轮新要求合并，生成完整策略文件。不得只回复生成说明、实现思路、源码文本或代码片段。
 - 需求完整时，必须先按本规则完成接口读取、语法检查和功能测试；同一份源码通过两项检查后，必须调用 write_generated_file 写入该完整源码，再向用户总结。不得因已有历史产物、用户未重复说“保存”，或已经写出文字/源码而省略写入工具。
 - “重新生成”“按刚才补充修改”“再加一条规则”等均是当前策略的生成/更新请求；即使是后续轮次，也要生成并写入更新后的完整策略，而非只描述改动。
-- 用户给出可识别的品种名称和交割月份但没有写合约代码时，必须调用 lookup_exchange_by_contract_code，并传 product_name 与数字 month；用户明确了年份或交易所时一并传 year 或 exchange_code。不要让模型凭记忆拼代码，也不要要求用户重复提供可推导的合约信息。年份未写时，由工具按本轮上海日期处理：目标月份尚未过去（含当前月）取当年，已过去取下一年。若结果为 expired，先复核年份；只有明确年份或用户明确提供的代码确已过期，才询问用户要改用哪个有效月份。
-- 用户给出具体期货合约代码时，无论是否同时写出交易所，都必须先以 contract_code 调用 lookup_exchange_by_contract_code；若上下文已包含本轮查询结果则直接使用，不要重复调用。若用户给出交易所，核对工具返回的 exchange_code 是否一致。生成源码时，必须把查询结果中的 canonical_contract_code 作为唯一合约代码来源，逐字保留其大小写；contract_code 是统一大写的识别字段，禁止用于生成源码。
+- 用户给出可识别的品种名称和交割月份时，若本轮系统提示已包含对应的预查询结果则直接使用；否则调用 lookup_exchange_by_contract_code，并传 product_name 与数字 month；用户明确了年份或交易所时一并传 year 或 exchange_code。不要让模型凭记忆拼代码，也不要要求用户重复提供可推导的合约信息。年份未写时，由工具按本轮上海日期处理：目标月份尚未过去（含当前月）取当年，已过去取下一年。若结果为 expired，先复核年份；只有明确年份或用户明确提供的代码确已过期，才询问用户要改用哪个有效月份。
+- 用户给出具体期货合约代码时，无论是否同时写出交易所，若本轮系统提示未包含对应的预查询结果，则以 contract_code 调用 lookup_exchange_by_contract_code；若已有对应结果则直接使用，不要重复调用。若用户给出交易所，核对工具返回的 exchange_code 是否一致。生成源码时，必须把查询结果中的 canonical_contract_code 作为唯一合约代码来源，逐字保留其大小写；contract_code 是统一大写的识别字段，禁止用于生成源码。
 - 品种与月份查询若返回唯一候选且 status 为 matched，直接进入后续流程，不进行确认式追问。若确实有缺项，把所有仍缺少且影响策略的参数合并为一次追问。
 - 查询工具只支持境内六家交易所期货，不支持期权。只有品种没有交割月份/具体合约，或“主力”等动态合约描述无法映射到固定代码时，才询问交割月份或合约代码。unrecognized 表示工具无法识别，不能据此断言合约不存在；invalid_format 表示代码格式无效。工具未识别时应说明目前无法核验，并询问交易所或更正后的代码，不得把“无法识别”说成“确认不存在”。
 - 生成策略之前，先调用 list_interface_files，再用 read_interface_file 阅读接口源码，尤其是 external_head.py 与 external_baseid.py。接口示例只是契约参考，不是用户需求。
@@ -26,13 +26,24 @@ TOOL_INSTRUCTIONS = """# 工具执行规则
 - 只能使用提供的工具。工具报错时根据错误调整调用，不要原样重复失败的工具名和参数；不要猜测读取结果或声称已保存失败的文件。"""
 
 
-def build_system_prompt(now: datetime | None = None) -> str:
+def build_system_prompt(
+    now: datetime | None = None,
+    *,
+    contract_context: str | None = None,
+) -> str:
     """Keep the stable prompt prefix cacheable and append volatile time last."""
     source = PROMPT_FILE.read_text(encoding="utf-8").removesuffix("\n")
     current = now or datetime.now(ZoneInfo("Asia/Shanghai"))
     shanghai_time = current.astimezone(ZoneInfo("Asia/Shanghai"))
     date_text = shanghai_time.strftime("%Y-%m-%d %H:%M（%A）")
     stable_prompt = f"{source}\n\n{TOOL_INSTRUCTIONS}"
+    if contract_context is not None:
+        stable_prompt += (
+            "\n\n# 本轮品种与交易所预查询结果\n"
+            "以下为正式会话前由模型调用查询工具获得的结果。"
+            "结果匹配当前请求时直接使用，不要重复查询；若为空或报错，则按实际需求继续处理。\n"
+            f"{contract_context}"
+        )
     current_time_suffix = (
         f"# 当前时间\n当前日期：{date_text}。"
         "代码文件头、元数据及所有输出中的日期必须使用该当天日期。"
