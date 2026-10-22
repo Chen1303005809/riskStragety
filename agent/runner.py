@@ -41,7 +41,8 @@ MAX_IDENTICAL_FAILED_TOOL_CALLS = 3
 logger = logging.getLogger(__name__)
 TOOL_FAILURE_REPAIR_PROMPT = (
     "上一个工具结果包含 error 或 passed=false。请先检查该工具结果中的具体诊断，"
-    "直接修改候选源码来修复失败原因；不得对完全相同的参数再次调用失败的工具。"
+    "功能检测失败时，以结果中的 failed_source 作为被测源码，直接修改它来修复失败原因；"
+    "不得原样返回失败源码或对完全相同的参数再次调用失败的工具。"
     "若功能检测结果包含 failed_cases，逐笔按其中的 ticks 推演源码状态变化，"
     "保留已通过用例的行为，不得修改测试预期。功能检测失败且源码有修改时，"
     "先重新调用 check_python_syntax，通过后再调用 run_functional_test。"
@@ -104,7 +105,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_functional_test",
-            "description": "按用户规则构造测试用例并在隔离沙盒中运行候选策略；必须先通过 check_python_syntax。",
+            "description": "按用户规则构造测试用例并在隔离沙盒中运行候选策略；必须先通过 check_python_syntax。失败时返回 failed_source（本次实际测试的完整源码）及失败用例诊断。",
             "parameters": {
                 "type": "object",
                 "properties": {"source": {"type": "string", "description": "通过语法检查的完整 Python 源码"}},
@@ -147,13 +148,14 @@ def _failure_context(message: str, tool_failures: Sequence[str]) -> str:
 
 
 def _tool_failure_context_entry(name: str, result: dict[str, Any]) -> str:
-    """Keep failed functional scenarios available without copying passing cases."""
+    """Keep failed scenarios in turn diagnostics without embedding full source."""
     failed_cases = result.get("failed_cases")
-    if name == "run_functional_test" and isinstance(failed_cases, list):
+    if name == "run_functional_test":
         details: dict[str, Any] = {"passed": False}
         if "case_count" in result:
             details["case_count"] = result["case_count"]
-        details["failed_cases"] = failed_cases
+        if isinstance(failed_cases, list):
+            details["failed_cases"] = failed_cases
         error = result.get("error")
         if error is not None:
             details["error"] = str(error)
@@ -780,7 +782,10 @@ class AgentRunner:
                         type(exc).__name__,
                         detail[:2_000],
                     )
-                    result, artifact = {"error": detail}, None
+                    result = {"error": detail}
+                    if call.name == "run_functional_test" and isinstance(source, str):
+                        result["failed_source"] = source
+                    artifact = None
                 except Exception as exc:
                     await record_trace(
                         "tool_result",
@@ -1007,6 +1012,7 @@ class AgentRunner:
                 validation.functional_passed.add(digest)
             else:
                 validation.functional_passed.discard(digest)
+                result = {**result, "failed_source": source}
             return result, None
         if call.name == "write_generated_file":
             source = args.get("source")

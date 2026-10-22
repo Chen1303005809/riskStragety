@@ -337,12 +337,15 @@ class SkillFunctionalTester:
             len(results),
             failed_case_indexes,
         )
-        return {
+        result: dict[str, Any] = {
             "passed": passed,
             "case_count": len(results),
             "cases": results,
             "failed_cases": failed_cases,
         }
+        if not passed:
+            result["failed_source"] = source
+        return result
 
 
 def _parse_test_cases(arguments: Any) -> tuple[FunctionalTestCase, ...]:
