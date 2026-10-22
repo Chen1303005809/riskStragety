@@ -354,7 +354,7 @@ function MonitorDashboard({
               <span className="monitor-state-tag" title={selectedAccountId}>{selectedAccountId || '选择账号'}</span>
             </div>
             {selectedAccountId && conversations ? (
-              <div className="monitor-list">
+              <div className="monitor-list monitor-session-list">
                 {conversationItems.map((conversation) => (
                   <button className={conversation.conversation_id === selectedConversationId ? 'monitor-list-item selected' : 'monitor-list-item'} type="button" key={conversation.conversation_id} onClick={() => selectConversation(conversation.conversation_id)} aria-pressed={conversation.conversation_id === selectedConversationId}>
                     <strong>{conversation.title || '未命名会话'}</strong>

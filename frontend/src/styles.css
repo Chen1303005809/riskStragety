@@ -145,6 +145,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .monitor-connection-card .connection-form { max-width: 660px; }
 .monitor-connection-card .connection-form input { min-width: 0; }
 .monitor-list { min-height: 0; flex: 1; overflow-y: auto; padding: 8px 10px 10px; }
+.monitor-session-list { max-height: min(48vh, 460px); }
 .monitor-list-item {
   width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: 5px;
   border: 1px solid transparent; border-radius: 9px; margin: 2px 0; padding: 11px 10px;
