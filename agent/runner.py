@@ -112,7 +112,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "list_skills",
-            "description": "列出当前 Agent 可用 Skill 的 ID、名称和简短描述。先检查目录，再加载与当前任务匹配的 Skill。",
+            "description": "仅当当前上下文尚未包含适用 Skill 指令且本轮尚未查询时，列出当前 Agent 可用 Skill 的 ID、名称和简短描述。不要重复列出。",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -120,7 +120,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "load_skill",
-            "description": "加载 Skill 的 SKILL.md；也可按需加载该 Skill 包内的 Markdown 参考文件。resource_path 省略时加载 SKILL.md。",
+            "description": "加载尚未出现在当前上下文中的 Skill 文件。已加载的资源不要重复读取；只在 Skill 指令链接到参考文件且任务需要时加载该参考。resource_path 省略时加载 SKILL.md。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -243,6 +243,19 @@ def _tool_call_signature(name: str, arguments: dict[str, Any]) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _loaded_skill_key(call: AssistantToolCall) -> tuple[str, str] | None:
+    """Return the normalized key used to deduplicate loaded Skill resources."""
+    if call.name != "load_skill":
+        return None
+    skill_id = call.arguments.get("skill_id")
+    resource_path = call.arguments.get("resource_path")
+    if not isinstance(skill_id, str):
+        return None
+    if resource_path is not None and not isinstance(resource_path, str):
+        return None
+    return skill_id, resource_path if resource_path is not None else "SKILL.md"
 
 
 def _tool_call_signature_digest(name: str, arguments: dict[str, Any]) -> str:
@@ -587,6 +600,7 @@ class AgentRunner:
         )
         skill_context_insert_index = 1
         loaded_skill_contexts: set[tuple[str, str]] = set()
+        skill_catalog_listed = False
 
         for round_index in range(self._max_tool_rounds + 1):
             round_options = model_options
@@ -865,6 +879,7 @@ class AgentRunner:
                 )
                 yield AgentEvent("status", {"phase": "tool_started", "tool": call.name})
                 try:
+                    requested_skill_key = _loaded_skill_key(call)
                     if call.name == "run_functional_test" and previous_failure is not None:
                         unchanged_source_replayed_this_round = True
                         await record_trace(
@@ -886,6 +901,24 @@ class AgentRunner:
                                 "源码语法树与此前失败版本相同，本次未重新运行沙盒；"
                                 "请按失败用例修改实现逻辑后再测试。"
                             ),
+                        }
+                        artifact = None
+                    elif call.name == "list_skills" and skill_catalog_listed:
+                        result = {
+                            "already_listed": True,
+                            "message": "本轮已查询并提供可用 Skill 列表，无需重复查询。",
+                        }
+                        artifact = None
+                    elif (
+                        requested_skill_key is not None
+                        and requested_skill_key in loaded_skill_contexts
+                    ):
+                        skill_id, resource_path = requested_skill_key
+                        result = {
+                            "skill_id": skill_id,
+                            "resource_path": resource_path,
+                            "already_loaded": True,
+                            "message": "此资源已加载并注入系统上下文，无需重复读取。",
                         }
                         artifact = None
                     else:
@@ -1000,9 +1033,19 @@ class AgentRunner:
                         "artifact",
                         {"artifact_id": artifact.artifact_id, "filename": artifact.filename},
                     )
+                if call.name == "list_skills" and isinstance(result.get("skills"), list):
+                    skill_catalog_listed = True
+
+                tool_result_for_model = result
+                if call.name == "load_skill" and isinstance(result.get("content"), str):
+                    tool_result_for_model = {
+                        key: value for key, value in result.items() if key != "content"
+                    }
+                    tool_result_for_model["loaded_into_system_context"] = True
+
                 messages.append(
                     ToolResultMessage(
-                        content=json.dumps(result, ensure_ascii=False),
+                        content=json.dumps(tool_result_for_model, ensure_ascii=False),
                         call_id=call.call_id,
                         tool_name=call.name,
                     )
