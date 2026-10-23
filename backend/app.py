@@ -298,6 +298,7 @@ def create_app(
             if deepseek_api_key is None:
                 raise MappedHTTPException(409, "provider_not_configured")
         conversation_id = str(payload.conversation_id)
+        account_logs = conversation_logs.for_account(payload.account_id)
         try:
             await monitoring.prepare_conversation(
                 payload.account_id, conversation_id, payload.message
@@ -330,7 +331,7 @@ def create_app(
                 if assistant_message_id is None or turn_finalized:
                     return
                 try:
-                    await conversation_logs.record(
+                    await account_logs.record(
                         conversation_id,
                         str(assistant_message_id),
                         "turn_finished",
@@ -367,7 +368,7 @@ def create_app(
                         payload.account_id, conversation_id, payload.message
                     )
                     history = [ChatTurn(role, content) for role, content in history_rows]
-                    await conversation_logs.record(
+                    await account_logs.record(
                         conversation_id,
                         str(assistant_message_id),
                         "turn_started",
@@ -391,7 +392,7 @@ def create_app(
                         account_id=payload.account_id,
                         conversation_id=conversation_id,
                         turn_id=str(assistant_message_id),
-                        conversation_recorder=conversation_logs,
+                        conversation_recorder=account_logs,
                         options=payload.options.model_dump(),
                         think=payload.think,
                     ):
@@ -428,7 +429,7 @@ def create_app(
                                     "ErrMsg": err_msg,
                                 },
                             )
-                            await conversation_logs.record(
+                            await account_logs.record(
                                 conversation_id,
                                 str(assistant_message_id),
                                 "turn_finished",
