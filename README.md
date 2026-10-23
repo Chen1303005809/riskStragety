@@ -68,7 +68,7 @@ curl -N http://127.0.0.1:8765/api/agent/chat/stream \
 | `status` | `phase`（开始或工具执行状态）、可选 `tool`。 |
 | `delta` | `text`，回复的流式片段。 |
 | `artifact` | `artifact_id`、`filename`，表示文件已保存。 |
-| `done` | 完整 `content`、`model`、本轮 `artifacts`、`usage`、`ErrCode`、`ErrMsg`。有产物时 `ErrCode` 为 `ok`；无产物时仍正常结束，但返回 `file_not_generated`。 |
+| `done` | 完整 `content`、`model`、本轮 `artifacts`、`usage`、`ErrCode`、`ErrMsg`。有本轮产物时 `ErrCode` 为 `ok`；缺少必要参数并追问时返回 `needs_input`。 |
 | `error` | `ErrCode`、`ErrMsg`；模型、Agent 或工具运行失败，以及 Agent 流提前结束。 |
 
 只有最终的 `done` 或 `error` 事件带 `ErrCode`、`ErrMsg`。`done` 的两个字段与 `content` 同级；HTTP 错误响应也在 JSON 顶层返回这两个字段，并保留 `detail`，其内容与 `ErrMsg` 一致。错误消息为固定客户端文案，不包含上游异常原文。
@@ -76,7 +76,8 @@ curl -N http://127.0.0.1:8765/api/agent/chat/stream \
 | ErrCode | 场景 | HTTP 状态 / SSE 事件 | ErrMsg |
 | --- | --- | --- | --- |
 | `ok` | SSE 正常完成且至少生成一个文件 | `done` | 空字符串 |
-| `file_not_generated` | SSE 正常完成，但 `artifacts` 为空 | `done` | 本轮已完成，但未生成策略文件。 |
+| `needs_input` | SSE 正常完成，Agent 用普通中文询问缺少的信息；历史文件不影响此状态 | `done` | 请根据助手提出的问题补充必要信息后继续。 |
+| `file_not_generated` | SSE 正常完成但没有产物，且没有参数追问状态的兼容兜底 | `done` | 本轮已完成，但未生成策略文件。 |
 | `auth_invalid` | Bearer API Key 无效 | HTTP 401 | API Key 无效 |
 | `request_invalid` | 请求体、参数或 UUID 格式无效 | HTTP 422 | 请求参数无效 |
 | `provider_not_configured` | 使用 DeepSeek 前没有配置 API Key | HTTP 409 | 请先配置 DeepSeek API Key |
@@ -93,7 +94,7 @@ curl -N http://127.0.0.1:8765/api/agent/chat/stream \
 
 `GET /api/models` 返回 Ollama 的模型列表；`GET /api/models?provider=deepseek` 返回 DeepSeek API 当前可用模型。响应还会给出 `deepseek_configured` 状态和 `default_model`。`GET /api/providers` 返回 provider 配置状态。`PUT /api/providers/deepseek` 使用 `{"api_key":"..."}` 验证并保存 DeepSeek Key，`DELETE /api/providers/deepseek` 清除 Key；这两个配置接口同样要求服务 Bearer Key。网页优先选择 provider 返回的默认模型。
 
-必要参数不足时，Agent 按提示词追问；用户补充后服务端从 SQLite 恢复此前历史。生成文件源码保存到 `artifacts/`，归属及会话索引写入 SQLite；Agent 不覆盖接口源码或已有文件。生成源码必须先通过 Python 3.7 语法检查，再由独立测试用例 Skill 根据对话需求构造行情用例，并在无网络、只读挂载且有限制的 Docker 沙盒中执行。沙盒模拟消息引擎及未实现的 `RHclient`；检测结果不代表真实行情引擎验证。
+必要参数不足时，Agent 以 `needs_input` 状态用普通中文追问；会话中已有产物不会阻止后续追问或修改。用户补充后服务端从 SQLite 恢复此前历史，Agent 继续生成并写入更新后的完整文件。只有本轮文件成功写入后才会报告本轮已生成文件；若模型声称本轮已生成但未成功写入，Agent 会把问题和约束交回模型修复，修复重试达到上限后才作为 Agent 失败处理。生成文件源码保存到 `artifacts/`，归属及会话索引写入 SQLite；Agent 不覆盖接口源码或已有文件。生成源码必须先通过 Python 3.7 语法检查，再由独立测试用例 Skill 根据对话需求构造行情用例，并在无网络、只读挂载且有限制的 Docker 沙盒中执行。沙盒模拟消息引擎及未实现的 `RHclient`；检测结果不代表真实行情引擎验证。
 
 Skill 文件位于 `agent/skills/<skill_id>/SKILL.md`。`SkillLoader` 是可复用的异步接口，`load(skill_id)` 返回包含 `skill_id` 与 `instructions` 的 `Skill`；默认 `FilesystemSkillLoader` 会校验 ID、路径、UTF-8 编码和大小。添加 Skill 时只需新增符合 ID 规则的目录及 `SKILL.md`。加载失败会让功能检测失败，不会回退到其他提示词；测试或其他存储来源可以通过实现 `SkillLoader` 注入。
 

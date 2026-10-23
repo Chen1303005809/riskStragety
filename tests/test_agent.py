@@ -67,6 +67,7 @@ class ScriptedModel(ModelGateway):
         self.rounds = rounds
         self.seen: list[list[AgentMessage]] = []
         self.settings_seen: list[tuple[dict[str, int | float], bool]] = []
+        self.next_round = 0
 
     async def list_models(self) -> list[str]:
         return ["model-a"]
@@ -75,10 +76,29 @@ class ScriptedModel(ModelGateway):
         self, model, messages, tools, *, options, think
     ) -> AsyncIterator[ModelChunk]:
         assert model == "model-a"
-        assert len(tools) == 6
+        is_preflight = (
+            len(tools) == 1
+            and tools[0]["function"]["name"] == "lookup_exchange_by_contract_code"
+        )
+        if is_preflight:
+            if self.next_round < len(self.rounds) and any(
+                call.name == "lookup_exchange_by_contract_code"
+                for chunk in self.rounds[self.next_round]
+                for call in chunk.tool_calls
+            ):
+                scripted = self.rounds[self.next_round]
+                self.next_round += 1
+                for chunk in scripted:
+                    yield chunk
+            else:
+                yield ModelChunk()
+            return
+
         self.seen.append(messages.copy())
         self.settings_seen.append((options.copy(), think))
-        for chunk in self.rounds[len(self.seen) - 1]:
+        scripted = self.rounds[self.next_round]
+        self.next_round += 1
+        for chunk in scripted:
             yield chunk
 
 
@@ -143,7 +163,7 @@ def test_exchange_lookup_success_flows_into_strategy_generation_without_exchange
         history=[], model="model-a", account_id="alice",
     )
 
-    lookup_result = model.seen[1][-1].content
+    lookup_result = model.seen[0][0].content
     assert '"exchange_code": "SHFE"' in lookup_result
     assert '"status": "matched"' in lookup_result
     assert artifacts.created == [("RiskStrategy.py", source, "alice")]
@@ -160,7 +180,7 @@ def test_unrecognized_contract_asks_only_for_exchange() -> None:
             [ModelChunk(tool_calls=(ToolCall(
                 "lookup_exchange_by_contract_code", {"contract_code": contract_code}
             ),))],
-            [ModelChunk(content=f"【参数补充请求】\n{expected_followup}")],
+            [ModelChunk(content=f"请补充以下信息：{expected_followup}")],
         ]
     )
 
@@ -170,7 +190,7 @@ def test_unrecognized_contract_asks_only_for_exchange() -> None:
         history=[], model="model-a", account_id="alice",
     )
 
-    assert f'"status": "{expected_status}"' in model.seen[1][-1].content
+    assert f'"status": "{expected_status}"' in model.seen[0][0].content
     assert events[-1].kind == "done"
     assert expected_followup in events[-1].data["content"]
 
@@ -184,7 +204,7 @@ def test_expired_contract_asks_for_a_valid_contract_code() -> None:
             [ModelChunk(tool_calls=(ToolCall(
                 "lookup_exchange_by_contract_code", {"contract_code": contract_code}
             ),))],
-            [ModelChunk(content="【参数补充请求】\n请提供有效合约代码。")],
+            [ModelChunk(content="请提供有效合约代码。")],
         ]
     )
 
@@ -194,7 +214,7 @@ def test_expired_contract_asks_for_a_valid_contract_code() -> None:
         history=[], model="model-a", account_id="alice",
     )
 
-    assert '"status": "expired"' in model.seen[1][-1].content
+    assert '"status": "expired"' in model.seen[0][0].content
     assert events[-1].kind == "done"
     assert "提供有效合约代码" in events[-1].data["content"]
 
@@ -262,7 +282,7 @@ def test_runner_preserves_unique_provider_call_ids_and_pairs_results() -> None:
                     )
                 )
             ],
-            [ModelChunk(content="【参数补充请求】请补充策略条件。")],
+            [ModelChunk(content="请补充策略条件。")],
         ]
     )
     runner = AgentRunner(model, MemoryInterfaces(), MemoryArtifacts())
@@ -300,44 +320,151 @@ def test_static_checker_uses_python_37_grammar() -> None:
 
 
 def test_missing_parameters_ask_without_creating_file() -> None:
-    model = ScriptedModel([[ModelChunk(content="【参数补充请求】\n请提供合约与阈值。")]])
+    model = ScriptedModel([[
+        ModelChunk(content="之前的策略文件已生成。请提供修改所需的触发阈值。")
+    ]])
     artifacts = MemoryArtifacts()
     events = collect(
         AgentRunner(model, MemoryInterfaces(), artifacts),
         message="螺纹钢突破时提醒",
-        history=[],
+        history=[
+            ChatTurn("user", "生成初版策略"),
+            ChatTurn("assistant", "已有策略文件可继续修改。"),
+        ],
         model="model-a",
         account_id="alice",
     )
     assert artifacts.created == []
     assert events[-1].kind == "done"
-    assert "参数补充请求" in events[-1].data["content"]
+    assert events[-1].data["content"] == "之前的策略文件已生成。请提供修改所需的触发阈值。"
+    assert events[-1].data["_completion"] == "needs_input"
 
 
-def test_unpersisted_or_empty_reply_is_not_reported_as_success() -> None:
-    for response in ("", "已生成策略，但没有保存文件。"):
-        model = ScriptedModel([[ModelChunk(content=response)]])
-        with pytest.raises(AgentError):
-            collect(
-                AgentRunner(model, MemoryInterfaces(), MemoryArtifacts()),
-                message="生成", history=[], model="model-a", account_id="alice"
-            )
+def test_empty_reply_is_not_reported_as_success() -> None:
+    model = ScriptedModel([[ModelChunk(content="")]])
+    with pytest.raises(AgentError, match="没有返回内容"):
+        collect(
+            AgentRunner(model, MemoryInterfaces(), MemoryArtifacts()),
+            message="生成", history=[], model="model-a", account_id="alice"
+        )
+
+
+def test_non_question_reply_without_artifact_is_still_an_agent_failure() -> None:
+    model = ScriptedModel([[ModelChunk(content="好的，我会继续处理。")]])
+    with pytest.raises(AgentError, match="未有效询问缺少的信息"):
+        collect(
+            AgentRunner(model, MemoryInterfaces(), MemoryArtifacts()),
+            message="生成策略", history=[], model="model-a", account_id="alice"
+        )
 
 
 def test_clarification_cannot_write_even_if_model_also_calls_write_tool() -> None:
-    model = ScriptedModel([[ModelChunk(
-        content="【参数补充请求】\n请提供阈值。",
-        tool_calls=(ToolCall("write_generated_file", {
-            "filename": "should-not-exist.py", "source": "x = 1\n"
-        }),),
-    )]])
+    model = ScriptedModel([
+        [ModelChunk(
+            content="请提供阈值。",
+            tool_calls=(ToolCall("write_generated_file", {
+                "filename": "should-not-exist.py", "source": "x = 1\n"
+            }),),
+        )],
+        [ModelChunk(content="请提供阈值。")],
+        [ModelChunk(content="请提供阈值。")],
+    ])
     artifacts = MemoryArtifacts()
     events = collect(
         AgentRunner(model, MemoryInterfaces(), artifacts),
         message="螺纹钢突破时提醒", history=[], model="model-a", account_id="alice"
     )
     assert artifacts.created == []
-    assert [event.kind for event in events] == ["status", "delta", "done"]
+    assert [event.kind for event in events].count("done") == 1
+    assert events[-1].data["_completion"] == "needs_input"
+
+
+def test_saved_artifact_can_be_followed_by_parameter_request() -> None:
+    source = _strategy_source()
+    model = ScriptedModel(
+        [
+            [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("write_generated_file", {"source": source}),))],
+            [ModelChunk(content="请补充修改后的触发阈值。")],
+        ]
+    )
+    artifacts = MemoryArtifacts()
+    events = collect(
+        AgentRunner(model, MemoryInterfaces(), artifacts, functional_tester=PassingFunctionalTester()),
+        message="先按已知规则生成，后续还需确认一个参数",
+        history=[],
+        model="model-a",
+        account_id="alice",
+    )
+
+    assert artifacts.created == [("RiskStrategy.py", source, "alice")]
+    assert events[-1].kind == "done"
+    assert events[-1].data["artifacts"] == [
+        {"artifact_id": "0" * 31 + "1", "filename": "RiskStrategy.py"}
+    ]
+    assert "_completion" not in events[-1].data
+
+
+def test_unsaved_artifact_claim_is_reworked_until_file_is_written() -> None:
+    source = _strategy_source()
+    model = ScriptedModel(
+        [
+            [ModelChunk(content="策略文件已生成。")],
+            [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": source}),))],
+            [ModelChunk(tool_calls=(ToolCall("write_generated_file", {"source": source}),))],
+            [ModelChunk(content="策略文件已保存。")],
+        ]
+    )
+    artifacts = MemoryArtifacts()
+    events = collect(
+        AgentRunner(model, MemoryInterfaces(), artifacts, functional_tester=PassingFunctionalTester()),
+        message="生成策略",
+        history=[],
+        model="model-a",
+        account_id="alice",
+    )
+
+    assert artifacts.created == [("RiskStrategy.py", source, "alice")]
+    assert events[-1].kind == "done"
+    assert len(events[-1].data["artifacts"]) == 1
+    assert events[-1].data["content"] == "策略文件已保存。"
+    assert any(
+        item.role == "user" and "本轮没有成功保存策略文件" in item.content
+        for item in model.seen[1]
+    )
+
+
+def test_unsaved_artifact_claim_can_be_corrected_to_a_natural_question() -> None:
+    model = ScriptedModel([
+        [ModelChunk(content="策略文件已生成。")],
+        [ModelChunk(content="请提供触发阈值。")],
+    ])
+    events = collect(
+        AgentRunner(model, MemoryInterfaces(), MemoryArtifacts()),
+        message="生成策略",
+        history=[],
+        model="model-a",
+        account_id="alice",
+    )
+
+    assert events[-1].kind == "done"
+    assert events[-1].data["_completion"] == "needs_input"
+    assert events[-1].data["content"] == "请提供触发阈值。"
+
+
+def test_repeated_unsaved_artifact_claim_stops_after_bounded_rework() -> None:
+    model = ScriptedModel([[ModelChunk(content="策略文件已生成。")]] * 4)
+    with pytest.raises(AgentError, match="多次声称已生成"):
+        collect(
+            AgentRunner(model, MemoryInterfaces(), MemoryArtifacts()),
+            message="生成策略",
+            history=[],
+            model="model-a",
+            account_id="alice",
+        )
+    assert len(model.seen) == 4
 
 
 def test_followup_receives_prior_turns_and_can_create_revision() -> None:
@@ -483,10 +610,12 @@ def test_unchanged_source_after_functional_failure_is_not_retested() -> None:
             [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": source}),))],
             [ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": source}),))],
             [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": source}),))],
+            [ModelChunk(content="仍然无法修复。")],
+            [ModelChunk(content="仍然无法修复。")],
         ]
     )
 
-    with pytest.raises(AgentError, match="源码与此前失败版本完全相同") as error:
+    with pytest.raises(AgentError, match="未保存策略文件") as error:
         collect(
             AgentRunner(
                 model,
@@ -587,6 +716,9 @@ def test_concurrent_runs_keep_messages_and_artifacts_separate() -> None:
             return ["model-a"]
 
         async def stream_chat(self, model, messages, tools, *, options, think):
+            if len(tools) == 1 and tools[0]["function"]["name"] == "lookup_exchange_by_contract_code":
+                yield ModelChunk()
+                return
             user_message = next(item.content for item in messages if item.role == "user")
             await asyncio.sleep(0.001)
             round_index = self.rounds.get(user_message, 0)

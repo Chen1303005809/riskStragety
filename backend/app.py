@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 ERROR_MESSAGES = {
     "ok": "",
+    "needs_input": "请根据助手提出的问题补充必要信息后继续。",
     "file_not_generated": "本轮已完成，但未生成策略文件。",
     "auth_invalid": "API Key 无效",
     "request_invalid": "请求参数无效",
@@ -402,14 +403,27 @@ def create_app(
                             content = event.data.get("content")
                             if isinstance(content, str):
                                 partial_content = [content]
-                            artifacts_data = event.data.get("artifacts")
+                            # AgentRunner uses _completion only as an internal
+                            # transport hint; expose the stable ErrCode instead.
+                            completion = event.data.get("_completion")
+                            public_data = {
+                                key: value
+                                for key, value in event.data.items()
+                                if key != "_completion"
+                            }
+                            artifacts_data = public_data.get("artifacts")
                             has_artifacts = isinstance(artifacts_data, list) and bool(artifacts_data)
-                            err_code = "ok" if has_artifacts else "file_not_generated"
+                            if has_artifacts:
+                                err_code = "ok"
+                            elif completion == "needs_input":
+                                err_code = "needs_input"
+                            else:
+                                err_code = "file_not_generated"
                             err_msg = ERROR_MESSAGES[err_code]
                             done_event = AgentEvent(
                                 "done",
                                 {
-                                    **event.data,
+                                    **public_data,
                                     "ErrCode": err_code,
                                     "ErrMsg": err_msg,
                                 },

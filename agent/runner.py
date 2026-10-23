@@ -38,6 +38,7 @@ from agent.prompt import build_system_prompt
 
 MAX_TOOL_ROUNDS = 30
 MAX_IDENTICAL_FAILED_TOOL_RETRIES = 3
+MAX_UNSAVED_ARTIFACT_REPAIR_RETRIES = 3
 logger = logging.getLogger(__name__)
 TOOL_FAILURE_REPAIR_PROMPT = (
     "上一个工具结果包含 error 或 passed=false。请先检查该工具结果中的具体诊断，"
@@ -56,6 +57,36 @@ UNCHANGED_SOURCE_REPAIR_PROMPT = (
     "不要改测试预期，也不要只加注释、改空白或改变量名。修改后先调用 check_python_syntax，"
     "通过后再调用 run_functional_test。"
 )
+UNSAVED_ARTIFACT_REPAIR_PROMPT = (
+    "本轮没有成功保存策略文件，但你刚才声称文件已生成、更新或保存。请纠正这一点："
+    "如果现有信息足以完成需求，就继续完成接口读取、语法检查、功能检测，并成功调用 "
+    "write_generated_file；如果确实缺少会改变策略的必要信息，就直接用普通中文询问具体缺项，"
+    "并且不要调用代码检测或写入工具。"
+    "write_generated_file 成功返回之前，不得声称本轮文件已生成、更新或保存。"
+)
+ARTIFACT_GENERATION_CLAIM_PATTERN = re.compile(
+    r"(?:已|已经|成功(?:地)?)\s*(?:为您|帮您|为你|帮你)?\s*"
+    r"(?:生成|创建|保存|写入|更新|修改|完成|做好|写好)(?:了)?\s*(?:完整的?)?"
+    r"(?:策略(?:文件)?|文件|产物|源码|版本)"
+    r"|(?:策略(?:文件)?|文件|产物|源码|版本)\s*"
+    r"(?:(?:已|已经)\s*(?:成功(?:地)?\s*)?|成功(?:地)?\s*)"
+    r"(?:生成|创建|保存|写入|更新|修改|完成|做好|写好)"
+)
+PARAMETER_CLARIFICATION_PATTERN = re.compile(
+    r"(?:请(?:您)?(?:提供|补充|告知|说明|明确|确认|告诉我)|"
+    r"(?:还|仍)?需要(?:您)?(?:提供|补充|告知|说明|明确|确认)|"
+    r"(?:我)?(?:还|仍)?需要(?:知道|确认|了解)|"
+    r"需要我.{0,16}(?:补充|提供|说明|确认)|"
+    r"(?:缺少|尚缺|还缺少|尚未提供).{0,32}|"
+    r"(?:方便|可以|能否).{0,32}(?:告诉|提供|补充|说明|明确)|"
+    r"(?:阈值|合约|交易所|交割月份|价格|规则|条件).{0,24}"
+    r"(?:多少|哪个|哪一个|什么|是否|如何).{0,12}[?？]|"
+    r"(?:请问|是否|哪个|哪一个|什么|多少).{0,48}[?？])"
+)
+HISTORICAL_ARTIFACT_REFERENCE_PATTERN = re.compile(
+    r"(?:历史|此前|先前|之前|上轮|上次)"
+)
+CURRENT_TURN_REFERENCE_PATTERN = re.compile(r"(?:本轮|本次|此次|刚刚|当前)")
 CONTRACT_LOOKUP_PREFLIGHT_PROMPT = """你负责为本轮期货策略请求预查询品种、合约和交易所信息。
 只检查当前请求及仍与当前请求相关的上下文。对用户明确给出的每个具体期货合约代码，调用 lookup_exchange_by_contract_code 并传 contract_code；对用户明确给出的品种和交割月份，调用该工具并传 product_name 与 month，显式年份和交易所一并传入。不得猜测合约代码、交割月份、年份或交易所。只有品种但没有月份或具体代码时，不调用工具。
 本次请求只用于调用查询工具，不要向用户回复文字；多个品种可在本次模型请求中分别调用工具。"""
@@ -125,7 +156,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "write_generated_file",
-            "description": "所有需求完整的策略生成、重新生成或业务规则更新请求在语法与功能检测通过后都必须调用此工具写入完整策略文件；不得只回复文字或源码。策略类标识符必须为 My_PythonObj，文件根据其 name 属性自动命名为 <name>.py；不得用于参数追问轮。",
+            "description": "所有需求完整的策略生成、重新生成或业务规则更新请求在语法与功能检测通过后都必须调用此工具写入完整策略文件；不得只回复文字或源码。策略类标识符必须为 My_PythonObj，文件根据其 name 属性自动命名为 <name>.py。确实缺少必要信息时，用普通中文询问并且不要调用写入工具。只有工具成功返回后才能声称本轮已生成、更新或保存文件；历史已有文件不妨碍后续轮继续询问或更新。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -267,6 +298,24 @@ def _model_chunk_for_log(chunk: ModelChunk) -> dict[str, Any]:
 def _exception_detail(exc: Exception) -> str:
     detail = str(exc).strip()
     return detail or f"{type(exc).__name__}（异常消息为空）"
+
+
+def _claims_artifact_generated(content: str) -> bool:
+    """Detect common claims that a file was generated without a successful write."""
+    for match in ARTIFACT_GENERATION_CLAIM_PATTERN.finditer(content):
+        preceding_context = content[max(0, match.start() - 32) : match.start()]
+        if (
+            HISTORICAL_ARTIFACT_REFERENCE_PATTERN.search(preceding_context) is not None
+            and CURRENT_TURN_REFERENCE_PATTERN.search(preceding_context) is None
+        ):
+            continue
+        return True
+    return False
+
+
+def _is_parameter_clarification(content: str) -> bool:
+    """Recognize natural-language requests for missing information."""
+    return PARAMETER_CLARIFICATION_PATTERN.search(content) is not None
 
 
 def _tool_result_log_summary(result: dict[str, Any]) -> str:
@@ -439,6 +488,7 @@ class AgentRunner:
         used_call_ids: set[str] = set()
         generated_call_id = 0
         tool_failure_repair_pending = False
+        unsaved_artifact_repair_count = 0
         functional_repair_mode = any(
             turn.role == "assistant" and "【上轮失败诊断】" in turn.content
             for turn in history
@@ -604,25 +654,51 @@ class AgentRunner:
                 usage,
             )
 
-            if "".join(round_content).lstrip().startswith("【参数补充请求】"):
-                if created:
-                    message = "已保存文件后不能再发出参数补充请求"
-                    raise AgentError(
-                        message,
-                        failure_context=_failure_context(message, tool_failures),
-                    )
-                logger.info(
-                    "agent_turn_completed conversation_id=%s model=%s artifacts=0 parameter_request=true",
-                    conversation_id or "-",
-                    model,
-                )
-                yield AgentEvent(
-                    "done",
-                    {"content": "".join(visible_content), "model": model, "artifacts": [], "usage": usage},
-                )
-                return
-
             if not calls:
+                round_reply = "".join(round_content)
+                turn_content = "".join(visible_content)
+                if not created and _claims_artifact_generated(turn_content):
+                    if unsaved_artifact_repair_count >= MAX_UNSAVED_ARTIFACT_REPAIR_RETRIES:
+                        message = "模型多次声称已生成策略文件，但始终没有成功写入"
+                        logger.error(
+                            "agent_unsaved_artifact_repair_exhausted conversation_id=%s "
+                            "model=%s retries=%d",
+                            conversation_id or "-",
+                            model,
+                            unsaved_artifact_repair_count,
+                        )
+                        raise AgentError(
+                            message,
+                            failure_context=_failure_context(message, tool_failures),
+                        )
+
+                    unsaved_artifact_repair_count += 1
+                    assistant_content = round_reply
+                    if assistant_content.strip() or round_reasoning_content:
+                        messages.append(
+                            AssistantMessage(
+                                assistant_content,
+                                reasoning_content="".join(round_reasoning_content),
+                            )
+                        )
+                    repair_prompt = UNSAVED_ARTIFACT_REPAIR_PROMPT
+                    if tool_failure_repair_pending:
+                        repair_prompt = TOOL_FAILURE_REPAIR_PROMPT + "\n\n" + repair_prompt
+                        tool_failure_repair_pending = False
+                    messages.append(UserMessage(repair_prompt))
+                    # The next completion replaces this unsubstantiated claim in the
+                    # authoritative done payload; streamed deltas remain transient.
+                    visible_content.clear()
+                    logger.warning(
+                        "agent_unsaved_artifact_repair_started conversation_id=%s "
+                        "model=%s retry=%d retry_limit=%d",
+                        conversation_id or "-",
+                        model,
+                        unsaved_artifact_repair_count,
+                        MAX_UNSAVED_ARTIFACT_REPAIR_RETRIES,
+                    )
+                    continue
+
                 if tool_failure_repair_pending:
                     assistant_content = "".join(round_content)
                     if assistant_content.strip() or round_reasoning_content:
@@ -644,30 +720,31 @@ class AgentRunner:
                             failure_context=_failure_context(message, tool_failures),
                         )
                     content = "策略文件已生成，请通过产物卡片预览或下载。"
-                if not created and "【参数补充请求】" not in content:
-                    message = "模型未保存策略文件，也未发出参数补充请求"
-                    raise AgentError(
-                        message,
-                        failure_context=_failure_context(message, tool_failures),
-                    )
+                if not created:
+                    if not _is_parameter_clarification(content):
+                        message = "模型未保存策略文件，也未有效询问缺少的信息"
+                        raise AgentError(
+                            message,
+                            failure_context=_failure_context(message, tool_failures),
+                        )
                 logger.info(
                     "agent_turn_completed conversation_id=%s model=%s artifacts=%d",
                     conversation_id or "-",
                     model,
                     len(created),
                 )
-                yield AgentEvent(
-                    "done",
-                    {
-                        "content": content,
-                        "model": model,
-                        "artifacts": [
-                            {"artifact_id": item.artifact_id, "filename": item.filename}
-                            for item in created
-                        ],
-                        "usage": usage,
-                    },
-                )
+                done_data = {
+                    "content": content,
+                    "model": model,
+                    "artifacts": [
+                        {"artifact_id": item.artifact_id, "filename": item.filename}
+                        for item in created
+                    ],
+                    "usage": usage,
+                }
+                if not created:
+                    done_data["_completion"] = "needs_input"
+                yield AgentEvent("done", done_data)
                 return
 
             if round_index >= self._max_tool_rounds:

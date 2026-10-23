@@ -13,7 +13,7 @@ function sseResponse(frames: string[], splitAt: number): Response {
 }
 
 describe('streamChat', () => {
-  it('sends complete history and parses split SSE frames', async () => {
+  it('omits legacy client history and parses split SSE frames', async () => {
     const fetchMock = vi.fn().mockResolvedValue(sseResponse([
       'event: status\ndata: {"phase":"started"}\n\n',
       'event: delta\ndata: {"text":"第一段"}\n\n',
@@ -43,10 +43,7 @@ describe('streamChat', () => {
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(init.method).toBe('POST');
     expect(init.headers).toMatchObject({ Authorization: 'Bearer my-key' });
-    expect(JSON.parse(init.body as string).history).toEqual([
-      { role: 'user', content: '原规则 3800' },
-      { role: 'assistant', content: '原策略已生成' },
-    ]);
+    expect(JSON.parse(init.body as string)).not.toHaveProperty('history');
     expect(status).toHaveBeenCalledWith('started', undefined);
     expect(delta.mock.calls.flat()).toEqual(['第一段', '第二段']);
     expect(artifact).toHaveBeenCalledWith({ artifact_id: 'abc', filename: 'risk.py' });

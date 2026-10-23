@@ -6,7 +6,11 @@ import App from './App';
 
 const artifactId = 'a'.repeat(32);
 
-function streamReply(content: string, withArtifact = false): Response {
+function streamReply(
+  content: string,
+  withArtifact = false,
+  errCode = withArtifact ? 'ok' : 'needs_input',
+): Response {
   const frames = [
     'event: status\ndata: {"phase":"started"}\n\n',
     'event: delta\ndata: ' + JSON.stringify({ text: content }) + '\n\n',
@@ -15,6 +19,8 @@ function streamReply(content: string, withArtifact = false): Response {
       content, model: 'model-b',
       artifacts: withArtifact ? [{ artifact_id: artifactId, filename: 'risk.py' }] : [],
       usage: {},
+      ErrCode: errCode,
+      ErrMsg: errCode === 'needs_input' ? '请根据助手提出的问题补充必要信息后继续。' : '',
     }) + '\n\n',
   ].join('');
   return new Response(new ReadableStream<Uint8Array>({
@@ -67,6 +73,7 @@ describe('chat page', () => {
     fireEvent.change(screen.getByLabelText('输入策略需求'), { target: { value: '螺纹钢预警' } });
     fireEvent.click(screen.getByText(/发送需求/));
     await screen.findByText('请补充阈值。');
+    expect(screen.queryByRole('alert')).toBeNull();
 
     fireEvent.change(screen.getByLabelText('输入策略需求'), { target: { value: 'SHFE rb2710 超过 3900' } });
     fireEvent.click(screen.getByText(/发送需求/));
@@ -78,10 +85,7 @@ describe('chat page', () => {
     expect(request.model).toBe('model-b');
     expect(request.options).toEqual({ temperature: 0.55, top_p: 0.9, num_ctx: 32768 });
     expect(request.think).toBe(true);
-    expect(request.history).toEqual([
-      { role: 'user', content: '螺纹钢预警' },
-      { role: 'assistant', content: '请补充阈值。' },
-    ]);
+    expect(request).not.toHaveProperty('history');
 
     fireEvent.click(screen.getByText('预览'));
     await screen.findByText('threshold = 3900');

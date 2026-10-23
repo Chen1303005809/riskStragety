@@ -45,6 +45,9 @@ class WorkingModel(ModelGateway):
         options: dict[str, int | float],
         think: bool,
     ) -> AsyncIterator[ModelChunk]:
+        if len(tools) == 1 and tools[0]["function"]["name"] == "lookup_exchange_by_contract_code":
+            yield ModelChunk()
+            return
         self.settings_seen.append((options.copy(), think))
         source = strategy_source()
         calls = [
@@ -65,7 +68,7 @@ class PassingFunctionalTester:
         return {"passed": True, "case_count": 1, "cases": [{"name": "case", "passed": True}]}
 
 
-def client_for(tmp_path: Path, model=None) -> TestClient:
+def client_for(tmp_path: Path, model=None, functional_tester=None) -> TestClient:
     (tmp_path / "interfaces" / "价格接口").mkdir(parents=True, exist_ok=True)
     settings = Settings(
         ollama_base_url="http://127.0.0.1:11434",
@@ -76,7 +79,11 @@ def client_for(tmp_path: Path, model=None) -> TestClient:
     return TestClient(create_app(
         settings,
         model_gateway=model or WorkingModel(),
-        functional_tester=PassingFunctionalTester(),
+        functional_tester=(
+            functional_tester
+            if functional_tester is not None
+            else PassingFunctionalTester()
+        ),
     ))
 
 
@@ -156,6 +163,9 @@ def test_followup_after_failed_tool_keeps_valid_model_turns(tmp_path: Path) -> N
             return ["model-a"]
 
         async def stream_chat(self, model, messages, tools, *, options, think):
+            if len(tools) == 1 and tools[0]["function"]["name"] == "lookup_exchange_by_contract_code":
+                yield ModelChunk()
+                return
             roles = [item.role for item in messages]
             users = [item.content for item in messages if item.role == "user"]
             self.role_sequences.append(roles)
@@ -164,7 +174,7 @@ def test_followup_after_failed_tool_keeps_valid_model_turns(tmp_path: Path) -> N
                 item.role == "assistant" and "【上轮失败诊断】" in item.content
                 for item in messages
             ):
-                yield ModelChunk(content="【参数补充请求】请提供触发阈值。")
+                yield ModelChunk(content="请提供触发阈值。")
             elif "初次尝试" in users[-1] and not any(
                 item.role == "tool" for item in messages
             ):
@@ -191,7 +201,7 @@ def test_followup_after_failed_tool_keeps_valid_model_turns(tmp_path: Path) -> N
     second_events = events_from(second.text)
 
     assert second_events[-1][0] == "done", second_events[-1]
-    assert "参数补充请求" in second_events[-1][1]["content"]
+    assert second_events[-1][1]["content"] == "请提供触发阈值。"
     assert model.role_sequences[-1] == ["system", "user", "assistant", "user"]
     assert [
         item.content for item in model.messages_seen[-1] if item.role == "user"
@@ -237,6 +247,9 @@ def test_model_unavailable_and_stream_failure_are_reported(tmp_path: Path) -> No
             raise ConnectionError("offline")
 
         async def stream_chat(self, model, messages, tools, *, options, think):
+            if len(tools) == 1 and tools[0]["function"]["name"] == "lookup_exchange_by_contract_code":
+                yield ModelChunk()
+                return
             yield ModelChunk(content="partial")
             raise ConnectionError("Ollama offline")
 
@@ -274,8 +287,11 @@ def test_chat_accepts_custom_model_options_and_think(tmp_path: Path) -> None:
             return ["model-a"]
 
         async def stream_chat(self, model, messages, tools, *, options, think):
+            if len(tools) == 1 and tools[0]["function"]["name"] == "lookup_exchange_by_contract_code":
+                yield ModelChunk()
+                return
             self.settings_seen.append((options.copy(), think))
-            yield ModelChunk(content="【参数补充请求】请补充交易所和合约代码。")
+            yield ModelChunk(content="请补充交易所和合约代码。")
 
     model = CapturingModel()
     client = client_for(tmp_path, model)
@@ -287,11 +303,135 @@ def test_chat_accepts_custom_model_options_and_think(tmp_path: Path) -> None:
     })
     assert response.status_code == 200
     done = events_from(response.text)[-1][1]
-    assert done["ErrCode"] == "file_not_generated"
-    assert done["ErrMsg"] == "本轮已完成，但未生成策略文件。"
+    assert done["ErrCode"] == "needs_input"
+    assert done["ErrMsg"] == "请根据助手提出的问题补充必要信息后继续。"
+    assert "_completion" not in done
     assert model.settings_seen == [
         ({"temperature": 0.55, "top_p": 0.9, "num_ctx": 32_768}, True)
     ]
+
+
+def test_existing_conversation_artifact_allows_clarification_then_revision(tmp_path: Path) -> None:
+    original = strategy_source("OriginalStrategy")
+    revised = strategy_source("RevisedStrategy")
+    same_turn_source = strategy_source("SameTurnStrategy")
+
+    class ConversationModel(ModelGateway):
+        def __init__(self) -> None:
+            self.steps: dict[str, int] = {}
+            self.main_messages: list[list[AgentMessage]] = []
+
+        async def list_models(self) -> list[str]:
+            return ["model-a"]
+
+        async def stream_chat(self, model, messages, tools, *, options, think):
+            if len(tools) == 1 and tools[0]["function"]["name"] == "lookup_exchange_by_contract_code":
+                yield ModelChunk()
+                return
+
+            self.main_messages.append(list(messages))
+            current_request = [item.content for item in messages if item.role == "user"][-1]
+            step = self.steps.get(current_request, 0)
+            self.steps[current_request] = step + 1
+            if current_request == "生成初版策略":
+                plan = [
+                    ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": original}),)),
+                    ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": original}),)),
+                    ModelChunk(tool_calls=(ToolCall("write_generated_file", {"source": original}),)),
+                    ModelChunk(content="初版策略已生成。"),
+                ]
+            elif current_request == "把预警规则改成另一个阈值":
+                plan = [ModelChunk(content="请提供新的触发阈值。")]
+            elif current_request == "先保存已知规则，再询问另一项缺失信息":
+                plan = [
+                    ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": same_turn_source}),)),
+                    ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": same_turn_source}),)),
+                    ModelChunk(tool_calls=(ToolCall("write_generated_file", {"source": same_turn_source}),)),
+                    ModelChunk(content="请补充另一项必要参数。"),
+                ]
+            else:
+                plan = [
+                    ModelChunk(tool_calls=(ToolCall("check_python_syntax", {"source": revised}),)),
+                    ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": revised}),)),
+                    ModelChunk(tool_calls=(ToolCall("write_generated_file", {"source": revised}),)),
+                    ModelChunk(content="策略已更新。"),
+                ]
+            yield plan[step]
+
+    class RecordingFunctionalTester(PassingFunctionalTester):
+        def __init__(self) -> None:
+            self.requirements_seen: list[list[ChatTurn]] = []
+
+        async def run(self, source, *, requirements, model, options):
+            self.requirements_seen.append(list(requirements))
+            return await super().run(source, requirements=requirements, model=model, options=options)
+
+    model = ConversationModel()
+    tester = RecordingFunctionalTester()
+    client = client_for(tmp_path, model, tester)
+
+    first = client.post("/api/agent/chat/stream", headers=AUTH, json={
+        **CHAT_CONTEXT,
+        "message": "生成初版策略",
+    })
+    first_events = events_from(first.text)
+    first_done = first_events[-1][1]
+    first_artifact = next(data for kind, data in first_events if kind == "artifact")
+    assert first_done["ErrCode"] == "ok"
+    assert first_done["artifacts"] == [{
+        "artifact_id": first_artifact["artifact_id"],
+        "filename": first_artifact["filename"],
+    }]
+
+    clarification = client.post("/api/agent/chat/stream", headers=AUTH, json={
+        **CHAT_CONTEXT,
+        "message": "把预警规则改成另一个阈值",
+    })
+    clarification_events = events_from(clarification.text)
+    clarification_done = clarification_events[-1][1]
+    assert clarification_events[-1][0] == "done"
+    assert clarification_done["ErrCode"] == "needs_input"
+    assert clarification_done["artifacts"] == []
+    assert "新的触发阈值" in clarification_done["content"]
+
+    # A clarification turn does not remove or detach the artifact already stored.
+    download = client.post("/api/artifacts/download", headers=AUTH, json={
+        "artifact_id": first_artifact["artifact_id"],
+        "account_id": "test-account",
+    })
+    assert download.status_code == 200
+    assert download.content == original.encode()
+
+    revision = client.post("/api/agent/chat/stream", headers=AUTH, json={
+        **CHAT_CONTEXT,
+        "message": "新阈值为 3900",
+    })
+    revision_events = events_from(revision.text)
+    revision_done = revision_events[-1][1]
+    assert revision_done["ErrCode"] == "ok"
+    assert len(revision_done["artifacts"]) == 1
+    assert revision_done["artifacts"][0]["filename"] == "RevisedStrategy.py"
+    assert tester.requirements_seen[-1] == [
+        ChatTurn("user", "生成初版策略"),
+        ChatTurn("assistant", "初版策略已生成。"),
+        ChatTurn("user", "把预警规则改成另一个阈值"),
+        ChatTurn("assistant", "请提供新的触发阈值。"),
+        ChatTurn("user", "新阈值为 3900"),
+    ]
+    assert any(
+        [item.content for item in messages if item.role == "user"][-1] == "新阈值为 3900"
+        for messages in model.main_messages
+    )
+
+    same_turn = client.post("/api/agent/chat/stream", headers=AUTH, json={
+        **CHAT_CONTEXT,
+        "message": "先保存已知规则，再询问另一项缺失信息",
+    })
+    same_turn_events = events_from(same_turn.text)
+    same_turn_done = same_turn_events[-1][1]
+    assert same_turn_done["ErrCode"] == "ok"
+    assert same_turn_done["artifacts"][0]["filename"] == "SameTurnStrategy.py"
+    assert same_turn_done["content"] == "请补充另一项必要参数。"
 
 
 def test_chat_rejects_invalid_model_options_and_think(tmp_path: Path) -> None:
@@ -322,6 +462,9 @@ def test_concurrent_sse_requests_have_distinct_history_and_artifacts(tmp_path: P
             return ["model-a"]
 
         async def stream_chat(self, model, messages, tools, *, options, think):
+            if len(tools) == 1 and tools[0]["function"]["name"] == "lookup_exchange_by_contract_code":
+                yield ModelChunk()
+                return
             user = next(item.content for item in reversed(messages) if item.role == "user")
             await asyncio.sleep(0.001)
             index = self.rounds.get(user, 0)
