@@ -111,12 +111,6 @@ class ModelGateway(ABC):
         """Release provider resources; lightweight test gateways may do nothing."""
 
 
-class InterfaceReader(Protocol):
-    async def list_files(self) -> list[str]: ...
-
-    async def read_file(self, filename: str) -> str: ...
-
-
 class ArtifactWriter(Protocol):
     async def create(
         self, filename: str, source: str, account_id: str, conversation_id: str | None = None

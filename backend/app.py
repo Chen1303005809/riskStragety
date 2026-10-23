@@ -23,7 +23,7 @@ from agent.functional_tests import SkillFunctionalTester, SkillTestCaseBuilder
 from agent.runner import AgentRunner
 from agent.skills import FilesystemSkillLoader
 from backend.adapters.conversation_logs import ConversationLogStore
-from backend.adapters.files import IndexedArtifactWriter, LocalArtifactStore, LocalInterfaceReader
+from backend.adapters.files import IndexedArtifactWriter, LocalArtifactStore
 from backend.adapters.provider_settings import ProviderSettingsStore
 from backend.adapters.monitoring import (
     AccountNotFound,
@@ -156,19 +156,19 @@ def create_app(
     conversation_logs = ConversationLogStore(config.data_dir / "conversation_logs")
     provider_settings = ProviderSettingsStore(config.data_dir / "provider_settings.sqlite3")
     interface_directory = config.project_root / "interfaces" / "价格接口"
-    interfaces = LocalInterfaceReader(interface_directory)
+    skill_loader = FilesystemSkillLoader()
     artifact_writer = IndexedArtifactWriter(artifacts, monitoring)
     sandbox = DockerFunctionalSandbox(interface_directory, config.project_root)
 
     def build_runner(gateway: ModelGateway) -> AgentRunner:
         selected_tester = functional_tester or SkillFunctionalTester(
-            SkillTestCaseBuilder(gateway, FilesystemSkillLoader()), sandbox
+            SkillTestCaseBuilder(gateway, skill_loader), sandbox
         )
         return AgentRunner(
             gateway,
-            interfaces,
             artifact_writer,
             functional_tester=selected_tester,
+            skill_loader=skill_loader,
         )
 
     runner = agent_runner or build_runner(model)

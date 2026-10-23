@@ -8,12 +8,12 @@
 | --- | --- |
 | `frontend/` | React 页面；`src/api.ts` 集中处理 HTTP、SSE、预览和下载请求。服务 Bearer Key 与账号 ID 只在页面内存中。 |
 | `backend/` | FastAPI 路由、Bearer 认证、在线模型服务配置、请求校验、SSE 映射和适配器装配。 |
-| `agent/` | 原文迁移的系统提示词、按轮次添加上海日期、历史消息组织和有上限的工具调用循环。无 FastAPI 依赖。 |
-| `interfaces/价格接口/` | 从旧项目迁入的 Python 接口源码。Agent 可列出和读取，运行时不写入。 |
+| `agent/` | 通用会话提示词、可发现的 Skill 包、按轮次添加上海日期、历史消息组织和有上限的工具调用循环。无 FastAPI 依赖。 |
+| `interfaces/价格接口/` | 从旧项目迁入的 Python 接口源码。Agent 不读取源码；功能测试沙盒以只读方式加载运行测试所需接口。 |
 | `artifacts/` | 生成的 Python 源码及迁移前遗留的 JSON 元数据。新产物归属和会话索引写入 SQLite。 |
 | `data/` | 默认数据目录，保存账号、会话、消息、产物索引、DeepSeek Key 配置和会话交互日志；可由 `APP_DATA_DIR` 调整。 |
 
-`AgentRunner.run(...)` 是后端调用 Agent 的边界，返回异步业务事件。模型、接口读取和产物存储都经接口注入。共享 Bearer API Key 负责认证，账号 ID 负责数据归属，不是身份凭证；持有共享 Key 的调用方可以查看所有账号的监控数据。聊天时第一次使用的账号 ID（去除首尾空白后）和 UUID 会创建账号及会话，会话绑定账号且不能转移。服务端从 SQLite 恢复对话历史，并把用户消息、Agent 回复和文件关联持久化。网页的监控总览可浏览账号、会话、消息和生成文件。
+`AgentRunner.run(...)` 是后端调用 Agent 的边界，返回异步业务事件。模型、功能测试器、Skill loader 和产物存储都经接口注入。共享 Bearer API Key 负责认证，账号 ID 负责数据归属，不是身份凭证；持有共享 Key 的调用方可以查看所有账号的监控数据。聊天时第一次使用的账号 ID（去除首尾空白后）和 UUID 会创建账号及会话，会话绑定账号且不能转移。服务端从 SQLite 恢复对话历史，并把用户消息、Agent 回复和文件关联持久化。网页的监控总览可浏览账号、会话、消息和生成文件。
 
 每个会话还会在 `APP_DATA_DIR/conversation_logs/<conversation_id>.jsonl`（默认 `data/conversation_logs/`）追加完整交互日志。日志包含每轮开始时的历史和用户消息、发送给主模型及功能检测模型的 system/user/assistant/tool 上下文、模型回复片段、工具调用参数与结果、沙盒用例和结果，以及完成、失败或中断状态。每条记录独立为一行 JSON；同一 `conversation_id` 续聊时追加到原文件。日志目录权限为 `0700`，文件权限为 `0600`。
 
@@ -94,9 +94,9 @@ curl -N http://127.0.0.1:8765/api/agent/chat/stream \
 
 `GET /api/models` 返回 Ollama 的模型列表；`GET /api/models?provider=deepseek` 返回 DeepSeek API 当前可用模型。响应还会给出 `deepseek_configured` 状态和 `default_model`。`GET /api/providers` 返回 provider 配置状态。`PUT /api/providers/deepseek` 使用 `{"api_key":"..."}` 验证并保存 DeepSeek Key，`DELETE /api/providers/deepseek` 清除 Key；这两个配置接口同样要求服务 Bearer Key。网页优先选择 provider 返回的默认模型。
 
-必要参数不足时，Agent 以 `needs_input` 状态用普通中文追问；会话中已有产物不会阻止后续追问或修改。用户补充后服务端从 SQLite 恢复此前历史，Agent 继续生成并写入更新后的完整文件。只有本轮文件成功写入后才会报告本轮已生成文件；若模型声称本轮已生成但未成功写入，Agent 会把问题和约束交回模型修复，修复重试达到上限后才作为 Agent 失败处理。生成文件源码保存到 `artifacts/`，归属及会话索引写入 SQLite；Agent 不覆盖接口源码或已有文件。生成源码必须先通过 Python 3.7 语法检查，再由独立测试用例 Skill 根据对话需求构造行情用例，并在无网络、只读挂载且有限制的 Docker 沙盒中执行。沙盒模拟消息引擎及未实现的 `RHclient`；检测结果不代表真实行情引擎验证。
+必要参数不足时，Agent 以 `needs_input` 状态用普通中文追问；会话中已有产物不会阻止后续追问或修改。用户补充后服务端从 SQLite 恢复此前历史，Agent 继续生成并写入更新后的完整文件。只有本轮文件成功写入后才会报告本轮已生成文件；若模型声称本轮已生成但未成功写入，Agent 会把问题和约束交回模型修复，修复重试达到上限后才作为 Agent 失败处理。生成文件源码保存到 `artifacts/`，归属及会话索引写入 SQLite；Agent 不覆盖接口源码或已有文件。生成源码直接进入 Python 3.12 功能沙盒，由独立测试用例 Skill 根据对话需求构造行情用例，并在无网络、只读挂载且有限制的 Docker 沙盒中执行；功能测试通过后，同一份源码才可写入。沙盒模拟消息引擎及未实现的 `RHclient`；检测结果不代表真实行情引擎验证。
 
-Skill 文件位于 `agent/skills/<skill_id>/SKILL.md`。`SkillLoader` 是可复用的异步接口，`load(skill_id)` 返回包含 `skill_id` 与 `instructions` 的 `Skill`；默认 `FilesystemSkillLoader` 会校验 ID、路径、UTF-8 编码和大小。添加 Skill 时只需新增符合 ID 规则的目录及 `SKILL.md`。加载失败会让功能检测失败，不会回退到其他提示词；测试或其他存储来源可以通过实现 `SkillLoader` 注入。
+通用 Skill 位于 `agent/skills/<skill_id>/SKILL.md`，并以 frontmatter 的 `name` 和 `description` 声明元数据。Agent 通过 `list_skills` 发现可用 Skill（仅返回 ID、名称和描述），再通过 `load_skill` 按需加载主说明或 Skill 包内的 Markdown 参考资料；加载内容作为当前任务的指令进入模型上下文。新增说明类 Skill 时，只需添加合规的 Skill 包，无须修改 Agent 主流程。默认 `FilesystemSkillLoader` 校验 ID、包内路径、Markdown 文件类型、UTF-8 编码、文件大小及符号链接；不执行包内脚本。`visibility: internal` 的 Skill 不会出现在 Agent 目录中，也不能由 Agent 加载，功能测试器仍可单独注入并加载内部 `test_case_builder` Skill。`SkillLoader` 是可复用的异步接口，支持目录发现、入口加载和参考资料加载；测试或其他存储来源可以通过实现 `SkillLoader` 注入。
 
 监控读取接口沿用相同的 Bearer Key：
 
@@ -119,7 +119,7 @@ curl -X POST http://127.0.0.1:8765/api/artifacts/download \
   -o strategy.py
 ```
 
-下载接口按 `artifact_id` 查找文件，并使用请求中的 `account_id` 核对 SQLite 产物归属。成功响应以 `application/octet-stream` 分块发送原始 UTF-8 文件字节，并通过 `Content-Disposition` 提供 `.py` 文件名；浏览器客户端可读取响应字节并生成 `.py` 文件。策略主类标识符固定为 `My_PythonObj`，其 `name` 属性只能使用英文 ASCII 字母、数字、下划线和连字符，并以英文字母开头；文件名由该 `name` 值决定，例如 `name = "RiskAlertStrategy"` 会保存为 `RiskAlertStrategy.py`。文件名只允许直接的 `.py` 文件名；接口读取和产物下载都拒绝路径穿越及符号链接。人工清理时删除 `artifacts/` 下对应的 `.py` 文件；迁移前旧产物若有 `.json` sidecar，也可一并清理。
+下载接口按 `artifact_id` 查找文件，并使用请求中的 `account_id` 核对 SQLite 产物归属。成功响应以 `application/octet-stream` 分块发送原始 UTF-8 文件字节，并通过 `Content-Disposition` 提供 `.py` 文件名；浏览器客户端可读取响应字节并生成 `.py` 文件。策略主类标识符固定为 `My_PythonObj`，其 `name` 属性只能使用英文 ASCII 字母、数字、下划线和连字符，并以英文字母开头；文件名由该 `name` 值决定，例如 `name = "RiskAlertStrategy"` 会保存为 `RiskAlertStrategy.py`。文件名只允许直接的 `.py` 文件名；产物下载拒绝路径穿越及符号链接。人工清理时删除 `artifacts/` 下对应的 `.py` 文件；迁移前旧产物若有 `.json` sidecar，也可一并清理。
 
 Python 客户端示例见 [`examples/download_artifact_client.py`](examples/download_artifact_client.py)，它会分块接收二进制响应并增量解码为 UTF-8 源码文本。运行前，在文件末尾的 `if __name__ == "__main__"` 代码块中填写 API Key、账号 ID 和 artifact ID，并按需修改服务地址与输出文件名。
 
@@ -130,9 +130,8 @@ Python 客户端示例见 [`examples/download_artifact_client.py`](examples/down
 ## 验收
 
 ```bash
-conda activate risk-agent
-python -m pip install 'pytest>=8,<10' 'httpx>=0.27,<1'
-python -m pytest -q
+.venv/bin/python3.12 -m pip install 'pytest>=8,<10' 'httpx>=0.27,<1'
+.venv/bin/python3.12 -m pytest -q
 cd frontend
 npm run test
 npm run build

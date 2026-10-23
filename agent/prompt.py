@@ -1,4 +1,4 @@
-"""Load the preserved domain prompt and add per-turn operating context."""
+"""Assemble the shared Agent prompt and per-turn time context."""
 
 from __future__ import annotations
 
@@ -8,46 +8,23 @@ from zoneinfo import ZoneInfo
 
 
 PROMPT_FILE = Path(__file__).with_name("system_prompt.md")
-TOOL_INSTRUCTIONS = """# 工具执行规则
-- 用户明确要求生成、重新生成或重做策略，或要求给现有策略增加/修改业务规则时，必须把历史中已确认的需求与本轮新要求合并，生成完整策略文件。不得只回复生成说明、实现思路、源码文本或代码片段。
-- 需求完整时，必须先按本规则完成接口读取、语法检查和功能测试；同一份源码通过两项检查后，必须调用 write_generated_file 写入该完整源码，再向用户总结。不得因已有历史产物、用户未重复说“保存”，或已经写出文字/源码而省略写入工具。
-- “重新生成”“按刚才补充修改”“再加一条规则”等均是当前策略的生成/更新请求；即使是后续轮次，也要生成并写入更新后的完整策略，而非只描述改动。
-- 会话历史中已有生成文件，不代表后续修改需求已完整，也不妨碍继续询问缺失参数。若本轮确实缺少必要信息，用普通中文直接询问具体缺项；用户回答后再合并历史需求继续修改和写入。
-- 只有本轮 write_generated_file 成功返回后，才能声称本轮已生成、更新或保存文件。没有成功写入时，不能把源码文本、计划或历史产物说成本轮新生成的文件。
-- 用户给出可识别的品种名称和交割月份时，若本轮系统提示已包含对应的预查询结果则直接使用；否则调用 lookup_exchange_by_contract_code，并传 product_name 与数字 month；用户明确了年份或交易所时一并传 year 或 exchange_code。不要让模型凭记忆拼代码，也不要要求用户重复提供可推导的合约信息。年份未写时，由工具按本轮上海日期处理：目标月份尚未过去（含当前月）取当年，已过去取下一年。若结果为 expired，先复核年份；只有明确年份或用户明确提供的代码确已过期，才询问用户要改用哪个有效月份。
-- 用户给出具体期货合约代码时，无论是否同时写出交易所，若本轮系统提示未包含对应的预查询结果，则以 contract_code 调用 lookup_exchange_by_contract_code；若已有对应结果则直接使用，不要重复调用。若用户给出交易所，核对工具返回的 exchange_code 是否一致。生成源码时，必须把查询结果中的 canonical_contract_code 作为唯一合约代码来源，逐字保留其大小写；contract_code 是统一大写的识别字段，禁止用于生成源码。
-- 品种与月份查询若返回唯一候选且 status 为 matched，直接进入后续流程，不进行确认式追问。若确实有缺项，把所有仍缺少且影响策略的参数合并为一次追问。
-- 查询工具只支持境内六家交易所期货，不支持期权。只有品种没有交割月份/具体合约，或“主力”等动态合约描述无法映射到固定代码时，才询问交割月份或合约代码。unrecognized 表示工具无法识别，不能据此断言合约不存在；invalid_format 表示代码格式无效。工具未识别时应说明目前无法核验，并询问交易所或更正后的代码，不得把“无法识别”说成“确认不存在”。
-- 生成策略之前，先调用 list_interface_files，再用 read_interface_file 阅读接口源码，尤其是 external_head.py 与 external_baseid.py。接口示例只是契约参考，不是用户需求。
-- 完整策略源码只能通过工具调用在内部传递、检查并写入文件产物；面向用户的聊天回复不得包含完整策略源码，也不得通过分段内容拼出完整源码。工具调用中的 source 参数不受此限制。
-- 只有实质必要信息无法从对话或常规语义推导时才追问，并用普通中文简洁指出缺项；这一轮不得调用任何代码检测或写入工具。
-- 需求完整时，先对候选源码调用 check_python_syntax。只有通过后，才能对完全相同的 source 调用 run_functional_test；该工具会单独调用测试用例 Skill 构造用例并执行沙盒测试。
-- 语法或功能检测失败时，根据诊断修改源码，再重新运行语法检测和功能检测。不要自行替代 Skill 编造测试结果。
-- 如果历史中存在包含「【上轮失败诊断】」的助手消息，必须先读取其中的工具失败结果和最终错误，结合原始用户需求针对性修正；不要忽略诊断或原样重复失败调用。
-- 对所有需求完整的生成、重新生成或规则更新请求，仅当同一份源码通过两项检测后，必须调用 write_generated_file；写工具的 source 必须与检测通过的源码一致。文件名由策略类的 name 属性自动生成，保存为 `<name>.py`，不传 filename。没有成功调用写入工具及其成功结果前，不得宣称策略文件已生成、已更新或已保存。
-- 只能使用提供的工具。工具报错时根据错误调整调用，不要原样重复失败的工具名和参数；不要猜测读取结果或声称已保存失败的文件。"""
+TOOL_INSTRUCTIONS = """# 通用工具与 Skill 规则
+- 开始处理任务前调用 `list_skills` 查看可用 Skill；若有匹配项，先调用 `load_skill` 加载说明。只在 Skill 明确链接到参考文件且当前任务需要时再加载该 Markdown 参考。
+- `load_skill` 返回的内容是当前任务的专用操作说明；遵循其中与任务相关的约束。Skill 未覆盖的内容按通用规则和可用工具处理。
+- 需求缺少会改变结果的必要信息时，用普通语言简洁追问，不要猜测关键数据或虚报工具结果。
+- 只有写入工具成功返回后，才能声称产物已创建或更新。优先使用工具实际返回的文件名、状态和检测结果。
+- 只调用本轮提供的工具；工具失败时阅读具体诊断再调整调用。"""
 
 
-def build_system_prompt(
-    now: datetime | None = None,
-    *,
-    contract_context: str | None = None,
-) -> str:
-    """Keep the stable prompt prefix cacheable and append volatile time last."""
+def build_system_prompt(now: datetime | None = None) -> str:
+    """Keep shared guidance stable and append volatile Shanghai time last."""
     source = PROMPT_FILE.read_text(encoding="utf-8").removesuffix("\n")
     current = now or datetime.now(ZoneInfo("Asia/Shanghai"))
     shanghai_time = current.astimezone(ZoneInfo("Asia/Shanghai"))
     date_text = shanghai_time.strftime("%Y-%m-%d %H:%M（%A）")
     stable_prompt = f"{source}\n\n{TOOL_INSTRUCTIONS}"
-    if contract_context is not None:
-        stable_prompt += (
-            "\n\n# 本轮品种与交易所预查询结果\n"
-            "以下为正式会话前由模型调用查询工具获得的结果。"
-            "结果匹配当前请求时直接使用，不要重复查询；若为空或报错，则按实际需求继续处理。\n"
-            f"{contract_context}"
-        )
     current_time_suffix = (
-        f"# 当前时间\n当前日期：{date_text}。"
-        "代码文件头、元数据及所有输出中的日期必须使用该当天日期。"
+        f"# 当前上海时间\n{date_text}。"
+        "如果当前任务需要日期，以此时间为准。"
     )
     return f"{stable_prompt}\n\n{current_time_suffix}"

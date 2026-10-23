@@ -75,15 +75,91 @@ class MemorySandbox:
         ]
 
 
+def _skill_document(
+    skill_id: str,
+    body: str,
+    *,
+    name: str | None = None,
+    description: str = "A reusable test skill.",
+    visibility: str = "agent",
+) -> str:
+    return (
+        "---\n"
+        f"name: {name or skill_id}\n"
+        f"description: {description}\n"
+        f"visibility: {visibility}\n"
+        "---\n"
+        f"{body}\n"
+    )
+
+
 def test_filesystem_skill_loader_loads_confined_skill(tmp_path: Path) -> None:
     skill_file = tmp_path / "test_case_builder" / "SKILL.md"
     skill_file.parent.mkdir()
-    skill_file.write_text("# reusable instructions\n", encoding="utf-8")
+    skill_file.write_text(
+        _skill_document(
+            "test_case_builder",
+            "# reusable instructions",
+            name="Reusable test builder",
+        ),
+        encoding="utf-8",
+    )
 
     skill = asyncio.run(FilesystemSkillLoader(tmp_path).load("test_case_builder"))
 
     assert skill.skill_id == "test_case_builder"
+    assert skill.name == "Reusable test builder"
+    assert skill.description == "A reusable test skill."
     assert skill.instructions == "# reusable instructions"
+
+
+def test_filesystem_skill_catalog_hides_internal_skills_and_loads_markdown_references(
+    tmp_path: Path,
+) -> None:
+    visible = tmp_path / "price-alert-strategy"
+    (visible / "references").mkdir(parents=True)
+    (visible / "SKILL.md").write_text(
+        _skill_document(
+            "price-alert-strategy",
+            "Use the reference when needed.",
+            name="Price alert strategy",
+        ),
+        encoding="utf-8",
+    )
+    (visible / "references" / "contract.md").write_text(
+        "# Public contract\n", encoding="utf-8"
+    )
+    outside_reference = tmp_path / "outside.md"
+    outside_reference.write_text("outside", encoding="utf-8")
+    (visible / "references" / "linked.md").symlink_to(outside_reference)
+    internal = tmp_path / "test_case_builder"
+    internal.mkdir()
+    (internal / "SKILL.md").write_text(
+        _skill_document(
+            "test_case_builder", "internal instructions", visibility="internal"
+        ),
+        encoding="utf-8",
+    )
+    loader = FilesystemSkillLoader(tmp_path)
+
+    skills = asyncio.run(loader.list_skills())
+    reference = asyncio.run(
+        loader.load_resource("price-alert-strategy", "references/contract.md")
+    )
+
+    assert [(skill.skill_id, skill.name) for skill in skills] == [
+        ("price-alert-strategy", "Price alert strategy")
+    ]
+    assert skills[0].description == "A reusable test skill."
+    assert reference == "# Public contract"
+    with pytest.raises(SkillLoadError, match="只允许 Markdown"):
+        asyncio.run(loader.load_resource("price-alert-strategy", "source.py"))
+    with pytest.raises(SkillLoadError, match="目录内"):
+        asyncio.run(loader.load_resource("price-alert-strategy", "../secret.md"))
+    with pytest.raises(SkillLoadError, match="符号链接"):
+        asyncio.run(
+            loader.load_resource("price-alert-strategy", "references/linked.md")
+        )
 
 
 @pytest.mark.parametrize("skill_id", ["../secret", "test/case", "UpperCase", ""])
@@ -99,7 +175,7 @@ def test_filesystem_skill_loader_reports_missing_and_oversized_skills(tmp_path: 
 
     skill_file = tmp_path / "large" / "SKILL.md"
     skill_file.parent.mkdir()
-    skill_file.write_text("0123456789", encoding="utf-8")
+    skill_file.write_text(_skill_document("large", "0123456789"), encoding="utf-8")
     with pytest.raises(SkillLoadError, match="大小限制"):
         asyncio.run(loader.load("large"))
 
@@ -113,7 +189,9 @@ def test_filesystem_skill_loader_rejects_invalid_utf8_and_symlinks(tmp_path: Pat
 
     outside = tmp_path / "outside"
     outside.mkdir()
-    (outside / "SKILL.md").write_text("outside", encoding="utf-8")
+    (outside / "SKILL.md").write_text(
+        _skill_document("linked", "outside"), encoding="utf-8"
+    )
     (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
     with pytest.raises(SkillLoadError, match="不存在或不可读取"):
         asyncio.run(FilesystemSkillLoader(tmp_path).load("linked"))

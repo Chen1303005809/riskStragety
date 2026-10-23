@@ -21,7 +21,6 @@ from agent.contracts import (
     ChatTurn,
     ConversationRecorder,
     FunctionalTester,
-    InterfaceReader,
     ModelGateway,
     ModelMessage,
     SystemMessage,
@@ -34,6 +33,7 @@ from agent.exchange_lookup import (
     resolve_contract_by_product_month,
 )
 from agent.prompt import build_system_prompt
+from agent.skills import FilesystemSkillLoader, SkillLoader
 
 
 MAX_TOOL_ROUNDS = 30
@@ -46,23 +46,20 @@ TOOL_FAILURE_REPAIR_PROMPT = (
     "若工具结果提示复用了之前的失败诊断，说明源码没有变化；必须先修改实现逻辑，"
     "不得只改注释或空白后重试，也不得原样返回失败源码。"
     "若功能检测结果包含 failed_cases，逐笔按其中的 ticks 推演源码状态变化，"
-    "保留已通过用例的行为，不得修改测试预期。功能检测失败且源码有修改时，"
-    "先重新调用 check_python_syntax，通过后再调用 run_functional_test。"
+    "保留已通过用例的行为，不得修改测试预期。修复源码后重新调用 run_functional_test。"
     "不要只向用户描述失败，也不要保存未通过检测的源码。"
 )
 UNCHANGED_SOURCE_REPAIR_PROMPT = (
     "你刚刚提交的源码与失败版本具有相同的 Python 语法树，说明没有修改实现逻辑；"
     "上面的测试结果是复用的，没有重新运行沙盒。现在必须直接修复代码：先按 failed_cases 中"
     "每个 tick 的顺序追踪相关状态变量，再指出实际出错的判断或状态转换，并据此修改源码。"
-    "不要改测试预期，也不要只加注释、改空白或改变量名。修改后先调用 check_python_syntax，"
-    "通过后再调用 run_functional_test。"
+    "不要改测试预期，也不要只加注释、改空白或改变量名。修改后重新调用 run_functional_test。"
 )
 UNSAVED_ARTIFACT_REPAIR_PROMPT = (
-    "本轮没有成功保存策略文件，但你刚才声称文件已生成、更新或保存。请纠正这一点："
-    "如果现有信息足以完成需求，就继续完成接口读取、语法检查、功能检测，并成功调用 "
-    "write_generated_file；如果确实缺少会改变策略的必要信息，就直接用普通中文询问具体缺项，"
-    "并且不要调用代码检测或写入工具。"
-    "write_generated_file 成功返回之前，不得声称本轮文件已生成、更新或保存。"
+    "本轮没有成功保存产物，但你刚才声称文件已生成、更新或保存。请纠正这一点："
+    "如果现有信息足以完成需求，就按适用 Skill 完成要求的功能测试，并成功调用 "
+    "write_generated_file；如果缺少会改变结果的必要信息，就直接用普通中文询问具体缺项，"
+    "并且不要调用写入工具。write_generated_file 成功返回之前，不得声称本轮产物已保存。"
 )
 ARTIFACT_GENERATION_CLAIM_PATTERN = re.compile(
     r"(?:已|已经|成功(?:地)?)\s*(?:为您|帮您|为你|帮你)?\s*"
@@ -87,15 +84,18 @@ HISTORICAL_ARTIFACT_REFERENCE_PATTERN = re.compile(
     r"(?:历史|此前|先前|之前|上轮|上次)"
 )
 CURRENT_TURN_REFERENCE_PATTERN = re.compile(r"(?:本轮|本次|此次|刚刚|当前)")
-CONTRACT_LOOKUP_PREFLIGHT_PROMPT = """你负责为本轮期货策略请求预查询品种、合约和交易所信息。
-只检查当前请求及仍与当前请求相关的上下文。对用户明确给出的每个具体期货合约代码，调用 lookup_exchange_by_contract_code 并传 contract_code；对用户明确给出的品种和交割月份，调用该工具并传 product_name 与 month，显式年份和交易所一并传入。不得猜测合约代码、交割月份、年份或交易所。只有品种但没有月份或具体代码时，不调用工具。
+CONTRACT_CODE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])([A-Za-z]{1,3}\d{3,4})(?![A-Za-z0-9_])"
+)
+CONTRACT_LOOKUP_PREFLIGHT_PROMPT = """你负责为本轮期货价格策略请求预查询品种、合约和交易所信息。
+只检查当前请求及仍与当前请求相关的上下文；本轮与期货价格策略无关时，不调用工具。对本轮策略请求中用户明确给出的每个具体期货合约代码，必须调用 lookup_exchange_by_contract_code 并传 contract_code；对用户明确给出的品种和交割月份，必须调用该工具并传 product_name 与 month，显式年份和交易所一并传入。用户明确给出交易所时，也要将 exchange_code 一并传入以核对。不得猜测合约代码、交割月份、年份或交易所。只有品种但没有月份或具体代码时，不调用工具。
 本次请求只用于调用查询工具，不要向用户回复文字；多个品种可在本次模型请求中分别调用工具。"""
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "lookup_exchange_by_contract_code",
-            "description": "离线识别境内六家期货交易所的期货合约。用户给出具体合约代码时，无论是否给出交易所都传 contract_code 查询；用户给出品种和交割月份时传 product_name 与 month，可传 year、exchange_code 推导标准代码。若本轮系统提示已包含对应合约或品种月份的预查询结果，直接使用且不要重复查询；给出交易所时核对返回交易所。CZCE 合约后缀为三位数字（一位年份加两位月份），其他交易所为四位数字。unrecognized 表示工具无法识别，不代表合约不存在；不得据此断言不存在。canonical_contract_code 保留映射表大小写，是生成源码时唯一可用的合约代码；contract_code 仅供识别且统一大写。不支持期权。",
+            "description": "离线识别境内六家期货交易所的期货合约。可按具体合约代码查询，也可按品种和交割月份推导标准代码，并可传 year、exchange_code。CZCE 合约后缀为三位数字（一位年份加两位月份），其他交易所为四位数字。unrecognized 表示工具无法识别，不代表合约不存在。canonical_contract_code 保留映射表大小写；不支持期权。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -111,28 +111,31 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "list_interface_files",
-            "description": "列出价格接口目录中可供阅读的 Python 源码文件。生成代码前先调用。",
+            "name": "list_skills",
+            "description": "列出当前 Agent 可用 Skill 的 ID、名称和简短描述。先检查目录，再加载与当前任务匹配的 Skill。",
             "parameters": {"type": "object", "properties": {}},
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "read_interface_file",
-            "description": "阅读价格接口目录中指定 Python 文件的完整源码。",
+            "name": "load_skill",
+            "description": "加载 Skill 的 SKILL.md；也可按需加载该 Skill 包内的 Markdown 参考文件。resource_path 省略时加载 SKILL.md。",
             "parameters": {
                 "type": "object",
-                "properties": {"filename": {"type": "string", "description": "纯 .py 文件名"}},
-                "required": ["filename"],
+                "properties": {
+                    "skill_id": {"type": "string", "description": "list_skills 返回的 Skill ID"},
+                    "resource_path": {"type": "string", "description": "Skill 包内的相对 Markdown 路径，例如 references/interface-contract.md"},
+                },
+                "required": ["skill_id"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "check_python_syntax",
-            "description": "静态检查候选策略是否符合 Python 3.7 语法；修正源码后必须重新检查。",
+            "name": "run_functional_test",
+            "description": "按适用 Skill 和用户规则构造测试用例，并在 Python 3.12 隔离沙盒中运行候选源码。此前失败版本的 Python 语法树相同则复用上次失败用例，不重复运行沙盒，并要求先修改实现逻辑。失败时返回 failed_source（本次实际测试的完整源码）及失败用例诊断。",
             "parameters": {
                 "type": "object",
                 "properties": {"source": {"type": "string", "description": "完整 Python 源码"}},
@@ -143,20 +146,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "run_functional_test",
-            "description": "按用户规则构造测试用例并在隔离沙盒中运行候选策略；必须先通过 check_python_syntax。此前失败版本的 Python 语法树相同则复用上次失败用例，不重复运行沙盒，并要求先修改实现逻辑。失败时返回 failed_source（本次实际测试的完整源码）及失败用例诊断。",
-            "parameters": {
-                "type": "object",
-                "properties": {"source": {"type": "string", "description": "通过语法检查的完整 Python 源码"}},
-                "required": ["source"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "write_generated_file",
-            "description": "所有需求完整的策略生成、重新生成或业务规则更新请求在语法与功能检测通过后都必须调用此工具写入完整策略文件；不得只回复文字或源码。策略类标识符必须为 My_PythonObj，文件根据其 name 属性自动命名为 <name>.py。确实缺少必要信息时，用普通中文询问并且不要调用写入工具。只有工具成功返回后才能声称本轮已生成、更新或保存文件；历史已有文件不妨碍后续轮继续询问或更新。",
+            "description": "将通过 run_functional_test 的完整源码保存为产物。必须使用与功能测试完全相同的源码；确实缺少必要信息时先用普通中文追问。只有工具成功返回后才能声称产物已生成或更新。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -220,9 +211,9 @@ def _functional_failure_summary(result: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass
 class _ValidationState:
-    syntax_passed: set[str] = field(default_factory=set)
     functional_passed: set[str] = field(default_factory=set)
     canonical_contract_codes: dict[str, str] = field(default_factory=dict)
+    contract_code_validity: dict[str, bool] = field(default_factory=dict)
     failed_functional_sources: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
@@ -233,7 +224,7 @@ def _source_digest(source: str) -> str:
 def _source_behavior_digest(source: str) -> str:
     """Hash Python syntax while ignoring comments and formatting-only changes."""
     try:
-        tree = ast.parse(source, feature_version=(3, 7))
+        tree = ast.parse(source)
     except SyntaxError:
         return _source_digest(source)
     normalized = ast.dump(tree, annotate_fields=True, include_attributes=False)
@@ -407,6 +398,20 @@ def _contract_code_casing_error(
     return None
 
 
+def _contract_code_validation_error(
+    source: str, validation: _ValidationState
+) -> str | None:
+    """Require every literal contract code in the candidate to have matched lookup data."""
+    for match in CONTRACT_CODE_PATTERN.finditer(source):
+        normalized_code = match.group(1).upper()
+        if validation.contract_code_validity.get(normalized_code) is not True:
+            return (
+                f"源码中的合约代码 {match.group(1)!r} 尚未通过有效性查询；"
+                "请先查询该合约并确认结果 status 为 matched，再运行功能检测。"
+            )
+    return None
+
+
 def _coalesce_adjacent_turns(turns: Sequence[ChatTurn]) -> list[ChatTurn]:
     """Keep the chat role sequence valid when failed turns leave orphaned messages."""
     merged: list[ChatTurn] = []
@@ -419,36 +424,20 @@ def _coalesce_adjacent_turns(turns: Sequence[ChatTurn]) -> list[ChatTurn]:
     return merged
 
 
-def check_python_syntax(source: str) -> dict[str, Any]:
-    """Parse as Python 3.7 syntax and compile without executing the source."""
-    try:
-        ast.parse(source, filename="<generated strategy>", feature_version=(3, 7))
-        compile(source, "<generated strategy>", "exec")
-    except SyntaxError as exc:
-        return {
-            "passed": False,
-            "grammar": "Python 3.7",
-            "error": exc.msg,
-            "line": exc.lineno,
-            "column": exc.offset,
-        }
-    return {"passed": True, "grammar": "Python 3.7", "error": None}
-
-
 class AgentRunner:
     def __init__(
         self,
         model: ModelGateway,
-        interfaces: InterfaceReader,
         artifacts: ArtifactWriter,
         max_tool_rounds: int = MAX_TOOL_ROUNDS,
         functional_tester: FunctionalTester | None = None,
+        skill_loader: SkillLoader | None = None,
     ) -> None:
         self._model = model
-        self._interfaces = interfaces
         self._artifacts = artifacts
         self._max_tool_rounds = max_tool_rounds
         self._functional_tester = functional_tester
+        self._skill_loader = skill_loader or FilesystemSkillLoader()
 
     async def run(
         self,
@@ -512,7 +501,11 @@ class AgentRunner:
             else AssistantMessage(turn.content)
             for turn in conversation_turns
         )
-        lookup_tools = [TOOL_SCHEMAS[0]]
+        lookup_tool = next(
+            tool for tool in TOOL_SCHEMAS
+            if tool["function"]["name"] == "lookup_exchange_by_contract_code"
+        )
+        lookup_tools = [lookup_tool]
         await record_trace(
             "model_request",
             {
@@ -544,6 +537,9 @@ class AgentRunner:
                 continue
             call_id = tool_call.call_id or f"agent_preflight_lookup_{index}"
             call = AssistantToolCall(call_id, tool_call.name, tool_call.arguments)
+            yield AgentEvent(
+                "status", {"phase": "tool_started", "tool": call.name}
+            )
             try:
                 result, _ = await self._call_tool(
                     call,
@@ -569,21 +565,28 @@ class AgentRunner:
                     "result": result,
                 },
             )
+            yield AgentEvent(
+                "status", {"phase": "tool_finished", "tool": call.name}
+            )
 
-        contract_context = (
-            json.dumps(contract_lookup_results, ensure_ascii=False, indent=2)
-            if contract_lookup_results
-            else "未取得查询结果；正式会话需按实际需求继续查询或询问缺失信息。"
-        )
-        messages: list[ModelMessage] = [
-            SystemMessage(build_system_prompt(contract_context=contract_context))
-        ]
+        messages: list[ModelMessage] = [SystemMessage(build_system_prompt())]
+        if contract_lookup_results:
+            messages.append(
+                SystemMessage(
+                    "# 合约预查询工具结果\n"
+                    "以下是主会话开始前取得的查询结果，请遵循适用 Skill 对结果的处理要求；"
+                    "不要猜测、忽略或无故重复查询。\n"
+                    f"{json.dumps(contract_lookup_results, ensure_ascii=False, indent=2)}"
+                )
+            )
         messages.extend(
             UserMessage(turn.content)
             if turn.role == "user"
             else AssistantMessage(turn.content)
             for turn in conversation_turns
         )
+        skill_context_insert_index = 1
+        loaded_skill_contexts: set[tuple[str, str]] = set()
 
         for round_index in range(self._max_tool_rounds + 1):
             round_options = model_options
@@ -1004,6 +1007,22 @@ class AgentRunner:
                         tool_name=call.name,
                     )
                 )
+                if call.name == "load_skill" and isinstance(result.get("content"), str):
+                    skill_key = (
+                        str(result.get("skill_id", "")),
+                        str(result.get("resource_path", "SKILL.md")),
+                    )
+                    if skill_key not in loaded_skill_contexts:
+                        skill_context = (
+                            f"# Skill 指令：{skill_key[0]}"
+                            f"（{skill_key[1]}）\n\n{result['content']}"
+                        )
+                        messages.insert(
+                            skill_context_insert_index,
+                            SystemMessage(skill_context),
+                        )
+                        skill_context_insert_index += 1
+                        loaded_skill_contexts.add(skill_key)
                 yield AgentEvent("status", {"phase": "tool_finished", "tool": call.name})
 
             if tool_failure_repair_pending:
@@ -1044,6 +1063,20 @@ class AgentRunner:
             contract_code = args.get("contract_code")
             if isinstance(contract_code, str) and contract_code.strip():
                 result = lookup_exchange_by_contract_code(contract_code)
+                requested_exchange = args.get("exchange_code")
+                resolved_exchange = result.get("exchange_code")
+                if (
+                    isinstance(requested_exchange, str)
+                    and isinstance(resolved_exchange, str)
+                    and requested_exchange.upper() != resolved_exchange.upper()
+                ):
+                    result = {
+                        **result,
+                        "status": "exchange_mismatch",
+                        "is_valid": False,
+                        "requested_exchange_code": requested_exchange.upper(),
+                        "message": "合约代码对应的交易所与用户给出的交易所不一致。",
+                    }
             else:
                 product_name = args.get("product_name")
                 month = args.get("month")
@@ -1065,41 +1098,61 @@ class AgentRunner:
                 )
             normalized_code = result.get("contract_code")
             canonical_code = result.get("canonical_contract_code")
+            if isinstance(normalized_code, str):
+                validation.contract_code_validity[normalized_code.upper()] = (
+                    result.get("status") == "matched"
+                    and result.get("is_valid") is True
+                )
             if isinstance(normalized_code, str) and isinstance(canonical_code, str):
                 validation.canonical_contract_codes[normalized_code] = canonical_code
             return result, None
-        if call.name == "list_interface_files":
-            return {"files": await self._interfaces.list_files()}, None
-        if call.name == "read_interface_file":
-            filename = args.get("filename")
-            if not isinstance(filename, str):
-                raise ValueError("filename 必须是文件名字符串")
-            return {"filename": filename, "source": await self._interfaces.read_file(filename)}, None
-        if call.name == "check_python_syntax":
-            source = args.get("source")
-            if not isinstance(source, str):
-                raise ValueError("source 必须是字符串")
-            digest = _source_digest(source)
-            result = check_python_syntax(source)
-            if result["passed"]:
-                casing_error = _contract_code_casing_error(
-                    source, validation.canonical_contract_codes
-                )
-                if casing_error:
-                    result = {**result, "passed": False, "error": casing_error}
-            if result["passed"]:
-                validation.syntax_passed.add(digest)
-            else:
-                validation.syntax_passed.discard(digest)
-                validation.functional_passed.discard(digest)
-            return result, None
+        if call.name == "list_skills":
+            skills = await self._skill_loader.list_skills()
+            return {
+                "skills": [
+                    {
+                        "skill_id": skill.skill_id,
+                        "name": skill.name,
+                        "description": skill.description,
+                    }
+                    for skill in skills
+                ]
+            }, None
+        if call.name == "load_skill":
+            skill_id = args.get("skill_id")
+            if not isinstance(skill_id, str):
+                raise ValueError("skill_id 必须是字符串")
+            resource_path = args.get("resource_path")
+            skill = await self._skill_loader.load(skill_id)
+            if skill.visibility == "internal":
+                raise ValueError("此 Skill 仅供内部组件使用")
+            if resource_path is None:
+                return {
+                    "skill_id": skill.skill_id,
+                    "resource_path": "SKILL.md",
+                    "content": skill.instructions,
+                }, None
+            if not isinstance(resource_path, str):
+                raise ValueError("resource_path 必须是字符串")
+            content = await self._skill_loader.load_resource(skill_id, resource_path)
+            return {
+                "skill_id": skill_id,
+                "resource_path": resource_path,
+                "content": content,
+            }, None
         if call.name == "run_functional_test":
             source = args.get("source")
             if not isinstance(source, str):
                 raise ValueError("source 必须是字符串")
             digest = _source_digest(source)
-            if digest not in validation.syntax_passed:
-                raise ValueError("请先对完全相同的源码调用 check_python_syntax 并通过")
+            validation_error = _contract_code_validation_error(source, validation)
+            if validation_error:
+                raise ValueError(validation_error)
+            casing_error = _contract_code_casing_error(
+                source, validation.canonical_contract_codes
+            )
+            if casing_error:
+                raise ValueError(casing_error)
             if self._functional_tester is None:
                 raise ValueError("功能检测服务未配置，无法保存策略")
             try:
@@ -1157,8 +1210,9 @@ class AgentRunner:
             if not isinstance(source, str):
                 raise ValueError("source 必须是字符串")
             digest = _source_digest(source)
-            if digest not in validation.syntax_passed:
-                raise ValueError("保存前必须先通过同一份源码的 check_python_syntax")
+            validation_error = _contract_code_validation_error(source, validation)
+            if validation_error:
+                raise ValueError(validation_error)
             if digest not in validation.functional_passed:
                 raise ValueError("保存前必须先通过同一份源码的 run_functional_test")
             casing_error = _contract_code_casing_error(
@@ -1167,7 +1221,7 @@ class AgentRunner:
             if casing_error:
                 raise ValueError(casing_error)
             try:
-                source_tree = ast.parse(source, feature_version=(3, 7))
+                source_tree = ast.parse(source)
             except SyntaxError as exc:
                 raise ValueError(f"策略源码语法无效，无法确定策略类名：{exc.msg}") from exc
             strategy_classes = [

@@ -38,7 +38,7 @@ def test_ollama_list_and_stream_conversion() -> None:
                 yield SimpleNamespace(
                     message=SimpleNamespace(
                         content="正在读取", tool_calls=[SimpleNamespace(function=SimpleNamespace(
-                            name="read_interface_file", arguments='{"filename":"external_head.py"}'
+                            name="load_skill", arguments='{"skill_id":"price-alert-strategy"}'
                         ))], thinking="内部思考"
                     ),
                     done=False, prompt_eval_count=None, eval_count=None,
@@ -64,12 +64,12 @@ def test_ollama_list_and_stream_conversion() -> None:
                 SystemMessage("system prompt"),
                 UserMessage("hi"),
                 AssistantMessage(
-                    "读取接口",
+                    "加载 Skill",
                     tool_calls=(
                         AssistantToolCall(
                             "internal-call-1",
-                            "read_interface_file",
-                            {"filename": "external_head.py"},
+                            "load_skill",
+                            {"skill_id": "price-alert-strategy"},
                         ),
                     ),
                     reasoning_content="先查看源码",
@@ -77,7 +77,7 @@ def test_ollama_list_and_stream_conversion() -> None:
                 ToolResultMessage(
                     content='{"files": ["external_head.py"]}',
                     call_id="internal-call-1",
-                    tool_name="read_interface_file",
+                    tool_name="load_skill",
                 ),
             ],
             [],
@@ -98,12 +98,12 @@ def test_ollama_list_and_stream_conversion() -> None:
         {"role": "user", "content": "hi"},
         {
             "role": "assistant",
-            "content": "读取接口",
+                "content": "加载 Skill",
             "tool_calls": [
                 {
                     "function": {
-                        "name": "read_interface_file",
-                        "arguments": {"filename": "external_head.py"},
+                        "name": "load_skill",
+                        "arguments": {"skill_id": "price-alert-strategy"},
                     }
                 }
             ],
@@ -112,12 +112,14 @@ def test_ollama_list_and_stream_conversion() -> None:
         {
             "role": "tool",
             "content": '{"files": ["external_head.py"]}',
-            "tool_name": "read_interface_file",
+            "tool_name": "load_skill",
         },
     ]
     assert chunks[0].content == "正在读取"
     assert chunks[0].reasoning_content == "内部思考"
-    assert chunks[0].tool_calls == (ToolCall("read_interface_file", {"filename": "external_head.py"}),)
+    assert chunks[0].tool_calls == (
+        ToolCall("load_skill", {"skill_id": "price-alert-strategy"}),
+    )
     assert chunks[1].usage == {"prompt_tokens": 12, "completion_tokens": 4}
     assert seen["closed"] is True
 

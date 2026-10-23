@@ -1,8 +1,7 @@
-"""Restricted interface reading and persistent, immutable generated files."""
+"""Persistent, immutable generated file storage."""
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
 import re
@@ -14,7 +13,6 @@ from agent.contracts import Artifact, ArtifactWriter
 from backend.adapters.monitoring import MonitoringStore
 
 
-MAX_INTERFACE_BYTES = 512 * 1024
 MAX_ARTIFACT_BYTES = 1024 * 1024
 ARTIFACT_ID = re.compile(r"^[0-9a-f]{32}$")
 
@@ -32,39 +30,6 @@ def _plain_python_name(filename: str) -> str:
     ):
         raise ValueError("文件名必须是长度不超过 120 的纯 .py 文件名")
     return name
-
-
-class LocalInterfaceReader:
-    def __init__(self, directory: Path) -> None:
-        self._directory = directory
-
-    async def list_files(self) -> list[str]:
-        return await asyncio.to_thread(self._list_files)
-
-    def _list_files(self) -> list[str]:
-        if self._directory.is_symlink() or not self._directory.is_dir():
-            raise ValueError("接口目录不可用")
-        return sorted(
-            path.name
-            for path in self._directory.iterdir()
-            if path.is_file() and not path.is_symlink() and path.suffix.lower() == ".py"
-        )
-
-    async def read_file(self, filename: str) -> str:
-        return await asyncio.to_thread(self._read_file, filename)
-
-    def _read_file(self, filename: str) -> str:
-        name = _plain_python_name(filename)
-        if self._directory.is_symlink() or not self._directory.is_dir():
-            raise ValueError("接口目录不可用")
-        path = self._directory / name
-        if path.is_symlink() or not path.is_file() or path.resolve().parent != self._directory.resolve():
-            raise ValueError("接口文件不存在")
-        with path.open("rb") as handle:
-            data = handle.read(MAX_INTERFACE_BYTES + 1)
-        if len(data) > MAX_INTERFACE_BYTES:
-            raise ValueError("接口文件过大")
-        return data.decode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -103,10 +68,6 @@ class LocalArtifactStore:
         content = source.encode("utf-8")
         if len(content) > MAX_ARTIFACT_BYTES:
             raise ValueError("生成文件超过 1 MiB")
-        try:
-            ast.parse(source, filename=name, feature_version=(3, 7))
-        except SyntaxError as exc:
-            raise ValueError(f"Python 3.7 语法检查失败：{exc.msg}，第 {exc.lineno} 行") from exc
         if self._directory.is_symlink():
             raise ValueError("产物目录不能是符号链接")
         self._directory.mkdir(parents=True, exist_ok=True)

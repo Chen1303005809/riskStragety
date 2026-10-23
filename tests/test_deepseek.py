@@ -64,24 +64,24 @@ def _sse(payload: dict[str, Any]) -> str:
 def _messages() -> list[ModelMessage]:
     return [
         SystemMessage("system prompt"),
-        UserMessage("请读取两个接口"),
+        UserMessage("请加载两个 Skill 资料"),
         AssistantMessage(
             "开始读取",
             tool_calls=(
                 AssistantToolCall(
-                    "call-a", "read_interface_file", {"filename": "a.py"}
+                    "call-a", "load_skill", {"skill_id": "price-alert-strategy"}
                 ),
                 AssistantToolCall(
-                    "call-b", "read_interface_file", {"filename": "b.py"}
+                    "call-b", "load_skill", {"skill_id": "test_case_builder"}
                 ),
             ),
             reasoning_content="逐个读取文件",
         ),
         ToolResultMessage(
-            "读取结果 B", call_id="call-b", tool_name="read_interface_file"
+            "读取结果 B", call_id="call-b", tool_name="load_skill"
         ),
         ToolResultMessage(
-            "读取结果 A", call_id="call-a", tool_name="read_interface_file"
+            "读取结果 A", call_id="call-a", tool_name="load_skill"
         ),
     ]
 
@@ -91,7 +91,7 @@ def test_deepseek_wire_messages_use_call_ids_and_openai_argument_strings() -> No
 
     assert messages == [
         {"role": "system", "content": "system prompt"},
-        {"role": "user", "content": "请读取两个接口"},
+        {"role": "user", "content": "请加载两个 Skill 资料"},
         {
             "role": "assistant",
             "content": "开始读取",
@@ -100,16 +100,16 @@ def test_deepseek_wire_messages_use_call_ids_and_openai_argument_strings() -> No
                     "id": "call-a",
                     "type": "function",
                     "function": {
-                        "name": "read_interface_file",
-                        "arguments": '{"filename": "a.py"}',
+                        "name": "load_skill",
+                        "arguments": '{"skill_id": "price-alert-strategy"}',
                     },
                 },
                 {
                     "id": "call-b",
                     "type": "function",
                     "function": {
-                        "name": "read_interface_file",
-                        "arguments": '{"filename": "b.py"}',
+                        "name": "load_skill",
+                        "arguments": '{"skill_id": "test_case_builder"}',
                     },
                 },
             ],
