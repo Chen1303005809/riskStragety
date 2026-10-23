@@ -63,10 +63,12 @@ UNSAVED_ARTIFACT_REPAIR_PROMPT = (
 )
 ARTIFACT_GENERATION_CLAIM_PATTERN = re.compile(
     r"(?:已|已经|成功(?:地)?)\s*(?:为您|帮您|为你|帮你)?\s*"
+    r"(?:(?:按|按照|根据|依照|将|把)[^。！？\n]{1,32}?)?"
     r"(?:生成|创建|保存|写入|更新|修改|完成|做好|写好)(?:了)?\s*(?:完整的?)?"
     r"(?:策略(?:文件)?|文件|产物|源码|版本)"
     r"|(?:策略(?:文件)?|文件|产物|源码|版本)\s*"
     r"(?:(?:已|已经)\s*(?:成功(?:地)?\s*)?|成功(?:地)?\s*)"
+    r"(?:(?:按|按照|根据|依照)[^。！？\n]{1,32}?)?"
     r"(?:生成|创建|保存|写入|更新|修改|完成|做好|写好)"
 )
 PARAMETER_CLARIFICATION_PATTERN = re.compile(
@@ -147,7 +149,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "write_generated_file",
-            "description": "将通过 run_functional_test 的完整源码保存为产物。必须使用与功能测试完全相同的源码；确实缺少必要信息时先用普通中文追问。只有工具成功返回后才能声称产物已生成或更新。",
+            "description": "将通过 run_functional_test 的完整源码保存为产物。必须使用与功能测试完全相同的源码；确实缺少必要信息时先用普通中文追问。只有工具成功返回后才能声称产物已生成或更新。写入成功后，可在最终回复中附上与本次 source 完全一致的完整源码。",
             "parameters": {
                 "type": "object",
                 "properties": {
