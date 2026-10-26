@@ -405,13 +405,25 @@ def test_agent_discovers_and_loads_skill_instructions_and_markdown_references() 
         item for item in listed["skills"]
         if item["skill_id"] == "price-alert-strategy"
     )
+    kline_skill = next(
+        item for item in listed["skills"]
+        if item["skill_id"] == "kline-strategy"
+    )
     assert not any(item["skill_id"] == "test_case_builder" for item in listed["skills"])
     assert price_skill == {
         "skill_id": "price-alert-strategy",
         "name": "价格预警策略",
         "description": (
-            "创建或修改基于价格行情回调的期货预警策略源码；"
-            "当任务涉及本项目价格接口代码时使用。"
+            "创建或修改基于 Tick 行情回调的期货预警策略源码；"
+            "当用户要求使用 Tick 价格规则时使用。"
+        ),
+    }
+    assert kline_skill == {
+        "skill_id": "kline-strategy",
+        "name": "PythonGo K线策略",
+        "description": (
+            "创建或修改使用 PythonGo 历史 K 线查询或实时 K 线订阅的期货策略；"
+            "当用户明确要求以 K 线数据计算或触发通知时使用。"
         ),
     }
     assert all(isinstance(message, SystemMessage) for message in model.seen[3][:4])
@@ -775,7 +787,7 @@ def test_failed_functional_result_prevents_artifact_creation() -> None:
             AgentRunner(
                 model,
                 artifacts,
-                functional_tester=PassingFunctionalTester(passed=False),
+                functional_tester=LeakingFunctionalTester(passed=False),
             ),
             message="生成策略",
             history=[],

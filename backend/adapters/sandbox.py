@@ -41,6 +41,162 @@ _RHCLIENT_SHIM = """class RHclient:
         return no_op
 """
 
+_KLINE_SANDBOX_SHIM = '''
+class VtBarData:
+    """Sandbox-only equivalent of the documented PythonGo bar object."""
+
+    def __init__(self):
+        self.vtSymbol = ""
+        self.exchange = ""
+        self.cycleType = 1
+        self.tradingDay = ""
+        self.tradeDate = ""
+        self.time = ""
+        self.openPrice = 0.0
+        self.highPrice = 0.0
+        self.lowPrice = 0.0
+        self.closePrice = 0.0
+        self.openInterest = 0.0
+        self.volume = 0.0
+        self.volumeDelta = 0.0
+        self.turnover = 0.0
+        self.globalId = 0
+
+
+def _sandbox_kline_state(strategy):
+    state = getattr(strategy, "_sandbox_kline_state", None)
+    if state is None:
+        state = {
+            "queries": [],
+            "subscriptions": [],
+            "unsubscriptions": [],
+            "active_subscriptions": set(),
+        }
+        strategy._sandbox_kline_state = state
+    return state
+
+
+def _sandbox_ascii_string(value, limit, require_nonempty=False):
+    if not isinstance(value, str):
+        return False
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return (not require_nonempty or bool(value)) and len(encoded) < limit
+
+
+def _sandbox_validate_kline_args(
+    instrument, cycle_type, exchange, product, market_type, global_id
+):
+    if not _sandbox_ascii_string(instrument, 61, require_nonempty=True):
+        raise ValueError("instrument 必须是非空 ASCII 字符串且长度小于 61")
+    if isinstance(cycle_type, bool) or not isinstance(cycle_type, int) or not 1 <= cycle_type <= 14:
+        raise ValueError("cycle_type 必须是 1 到 14 的整数枚举")
+    if not _sandbox_ascii_string(exchange, 9):
+        raise ValueError("exchange 必须是 ASCII 字符串且长度小于 9")
+    if not _sandbox_ascii_string(product, 61):
+        raise ValueError("product 必须是 ASCII 字符串且长度小于 61")
+    if isinstance(market_type, bool) or not isinstance(market_type, int) or market_type != 1:
+        raise ValueError("market_type 当前只允许 1")
+    if isinstance(global_id, bool) or not isinstance(global_id, int):
+        raise ValueError("global_id 必须是整数")
+
+
+def _sandbox_validate_datetime(value, field):
+    if not _sandbox_ascii_string(value, 9):
+        raise ValueError("{} 必须是长度小于 9 的 ASCII 字符串".format(field))
+
+
+def _sandbox_query_history_kline(
+    self, instrument, cycle_type, count=None, exchange="", product="",
+    start_date="", start_time="", end_date="", end_time="",
+    market_type=1, global_id=0,
+):
+    _sandbox_validate_kline_args(
+        instrument, cycle_type, exchange, product, market_type, global_id
+    )
+    if isinstance(count, bool) or (count is not None and not isinstance(count, int)):
+        raise ValueError("count 必须是整数")
+    if bool(start_date) != bool(start_time) or bool(end_date) != bool(end_time):
+        raise ValueError("日期和时间必须成对提供")
+    has_start = bool(start_date and start_time)
+    has_end = bool(end_date and end_time)
+    if has_start:
+        for field, value in (("start_date", start_date), ("start_time", start_time)):
+            _sandbox_validate_datetime(value, field)
+    if has_end:
+        for field, value in (("end_date", end_date), ("end_time", end_time)):
+            _sandbox_validate_datetime(value, field)
+    if has_start and not has_end:
+        raise ValueError("区间查询必须同时提供开始和结束时间")
+    if has_start and has_end:
+        if count not in (None, 0):
+            raise ValueError("区间查询的 count 必须为 0 或省略")
+        if (start_date, start_time) > (end_date, end_time):
+            raise ValueError("开始时间不能晚于结束时间")
+        normalized_count = 0
+    else:
+        normalized_count = 500 if count is None else count
+        if not 1 <= normalized_count <= 2000:
+            raise ValueError("数量查询的 count 必须是 1 到 2000 的整数")
+    state = _sandbox_kline_state(self)
+    request_id = len(state["queries"]) + 1
+    state["queries"].append({
+        "instrument": instrument,
+        "cycle_type": cycle_type,
+        "count": normalized_count,
+        "exchange": exchange,
+        "product": product,
+        "start_date": start_date,
+        "start_time": start_time,
+        "end_date": end_date,
+        "end_time": end_time,
+        "market_type": market_type,
+        "global_id": global_id,
+        "request_id": request_id,
+    })
+    return request_id
+
+
+def _sandbox_kline_subscription_key(
+    instrument, cycle_type, exchange="", product="", market_type=1, global_id=0
+):
+    _sandbox_validate_kline_args(
+        instrument, cycle_type, exchange, product, market_type, global_id
+    )
+    return (market_type, instrument, cycle_type, exchange, product, global_id)
+
+
+def _sandbox_subscribe_kline(
+    self, instrument, cycle_type, exchange="", product="", market_type=1,
+    global_id=0,
+):
+    key = _sandbox_kline_subscription_key(
+        instrument, cycle_type, exchange, product, market_type, global_id
+    )
+    state = _sandbox_kline_state(self)
+    state["subscriptions"].append(key)
+    state["active_subscriptions"].add(key)
+
+
+def _sandbox_unsubscribe_kline(
+    self, instrument, cycle_type, exchange="", product="", market_type=1,
+    global_id=0,
+):
+    key = _sandbox_kline_subscription_key(
+        instrument, cycle_type, exchange, product, market_type, global_id
+    )
+    state = _sandbox_kline_state(self)
+    state["unsubscriptions"].append(key)
+    state["active_subscriptions"].discard(key)
+
+
+RHTemplate.queryHistoryKline = _sandbox_query_history_kline
+RHTemplate.subscribeKline = _sandbox_subscribe_kline
+RHTemplate.unsubscribeKline = _sandbox_unsubscribe_kline
+'''
+
 
 class DockerFunctionalSandbox:
     """Run each supplied scenario in one isolated, short-lived container."""
@@ -105,7 +261,8 @@ class DockerFunctionalSandbox:
             (stage / "strategy.py").write_bytes(source)
             (stage / "cases.json").write_bytes(cases_json)
             (stage / "external_head.py").write_bytes(
-                head + b"\nfrom RHclient import RHclient\n"
+                head + b"\n" + _KLINE_SANDBOX_SHIM.encode("utf-8")
+                + b"\nfrom RHclient import RHclient\n"
             )
             (stage / "external_baseid.py").write_bytes(baseid)
             (stage / "PyEngine.py").write_text(_PYENGINE_SHIM, encoding="utf-8")

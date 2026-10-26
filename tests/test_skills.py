@@ -70,6 +70,14 @@ class MemorySandbox:
                 "passed": True,
                 "expected_warning_count": case.expected_warning_count,
                 "actual_warning_count": case.expected_warning_count,
+                **(
+                    {
+                        "expected_calls": case.expected_calls,
+                        "actual_calls": case.expected_calls,
+                    }
+                    if case.expected_calls is not None
+                    else {}
+                ),
             }
             for case in cases
         ]
@@ -162,6 +170,23 @@ def test_filesystem_skill_catalog_hides_internal_skills_and_loads_markdown_refer
         )
 
 
+def test_kline_strategy_skill_is_discoverable_and_loads_contract_reference() -> None:
+    loader = FilesystemSkillLoader()
+
+    skills = asyncio.run(loader.list_skills())
+    kline_skill = next(skill for skill in skills if skill.skill_id == "kline-strategy")
+    instructions = asyncio.run(loader.load("kline-strategy"))
+    reference = asyncio.run(
+        loader.load_resource("kline-strategy", "references/interface-contract.md")
+    )
+
+    assert kline_skill.name == "PythonGo K线策略"
+    assert "历史 K 线查询" in kline_skill.description
+    assert "onHistoryKline" in instructions.instructions
+    assert "没有独立 ACK" in reference
+    assert "closePrice" in reference
+
+
 @pytest.mark.parametrize("skill_id", ["../secret", "test/case", "UpperCase", ""])
 def test_filesystem_skill_loader_rejects_invalid_ids(tmp_path: Path, skill_id: str) -> None:
     with pytest.raises(SkillLoadError, match="skill_id"):
@@ -241,6 +266,69 @@ def test_case_builder_uses_skill_and_separate_structured_model_request() -> None
     assert cases[0].expected_warning_count == 1
 
 
+def test_case_builder_accepts_ordered_kline_callbacks_and_expected_api_calls() -> None:
+    model = CaseModel(
+        {
+            "cases": [
+                {
+                    "name": "历史回包后实时预警",
+                    "events": [
+                        {
+                            "type": "history_response",
+                            "request_id": 1,
+                            "bars": [
+                                {
+                                    "vtSymbol": "rb2710",
+                                    "exchange": "SHFE",
+                                    "cycleType": 1,
+                                    "closePrice": 3800.0,
+                                }
+                            ],
+                            "error": None,
+                        },
+                        {
+                            "type": "kline",
+                            "bar": {
+                                "vtSymbol": "rb2710",
+                                "exchange": "SHFE",
+                                "cycleType": 1,
+                                "closePrice": 3801.0,
+                            },
+                        },
+                    ],
+                    "expected_calls": {
+                        "queryHistoryKline": 1,
+                        "subscribeKline": 1,
+                        "unsubscribeKline": 1,
+                    },
+                    "expected_warning_count": 1,
+                }
+            ]
+        }
+    )
+    builder = SkillTestCaseBuilder(model, MemorySkillLoader())
+
+    cases = asyncio.run(
+        builder.build(
+            source="class RiskStrategy(RHTemplate):\n    pass\n",
+            requirements=[ChatTurn("user", "使用 K 线规则预警")],
+            model="model-a",
+            options={"num_ctx": 16_384},
+        )
+    )
+
+    assert len(cases) == 1
+    assert cases[0].ticks == ()
+    assert cases[0].events[0]["request_id"] == 1
+    assert cases[0].events[0]["bars"][0]["closePrice"] == 3800.0
+    assert cases[0].expected_calls == {
+        "queryHistoryKline": 1,
+        "subscribeKline": 1,
+        "unsubscribeKline": 1,
+    }
+    assert cases[0].as_payload()["events"] == list(cases[0].events)
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -276,6 +364,54 @@ def test_case_builder_rejects_invalid_test_data(arguments: dict[str, Any]) -> No
                 options={"num_ctx": 16_384},
             )
         )
+
+
+def test_case_builder_rejects_kline_response_for_invalid_cycle_or_request_id() -> None:
+    invalid_cases = [
+        {
+            "cases": [
+                {
+                    "name": "无效周期",
+                    "events": [
+                        {
+                            "type": "kline",
+                            "bar": {"vtSymbol": "rb2710", "cycleType": 60},
+                        }
+                    ],
+                    "expected_warning_count": 0,
+                }
+            ]
+        },
+        {
+            "cases": [
+                {
+                    "name": "布尔请求号",
+                    "events": [
+                        {
+                            "type": "history_response",
+                            "request_id": True,
+                            "bars": [],
+                            "error": None,
+                        }
+                    ],
+                    "expected_warning_count": 0,
+                }
+            ]
+        },
+    ]
+
+    for arguments in invalid_cases:
+        with pytest.raises(FunctionalTestError):
+            asyncio.run(
+                SkillTestCaseBuilder(
+                    CaseModel(arguments), MemorySkillLoader()
+                ).build(
+                    source="class RiskStrategy: pass",
+                    requirements=[ChatTurn("user", "测试 K 线")],
+                    model="model-a",
+                    options={"num_ctx": 16_384},
+                )
+            )
 
 
 def test_case_builder_fails_closed_if_skill_model_does_not_submit_cases() -> None:
