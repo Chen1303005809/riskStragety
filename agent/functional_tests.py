@@ -343,8 +343,6 @@ class SkillFunctionalTester:
             "cases": results,
             "failed_cases": failed_cases,
         }
-        if not passed:
-            result["failed_source"] = source
         return result
 
 

@@ -356,6 +356,13 @@ def test_tool_schemas_expose_skills_but_no_static_or_interface_readers() -> None
         "list_interface_files",
         "read_interface_file",
     } & tool_names
+    functional_test_description = next(
+        tool["function"]["description"]
+        for tool in TOOL_SCHEMAS
+        if tool["function"]["name"] == "run_functional_test"
+    )
+    assert "failed_source" not in functional_test_description
+    assert "source 参数" in functional_test_description
 
 
 def test_agent_discovers_and_loads_skill_instructions_and_markdown_references() -> None:
@@ -743,6 +750,16 @@ def test_modified_source_must_pass_functional_test_again_before_saving() -> None
 
 def test_failed_functional_result_prevents_artifact_creation() -> None:
     source = _strategy_source()
+
+    class LeakingFunctionalTester(PassingFunctionalTester):
+        async def run(self, candidate, *, requirements, model, options):
+            result = await super().run(
+                candidate, requirements=requirements, model=model, options=options
+            )
+            result["failed_source"] = candidate
+            result["failed_cases"] = [{"index": 1, "name": "case"}]
+            return result
+
     model = ScriptedModel(
         [
             [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": source}),))],
@@ -768,6 +785,64 @@ def test_failed_functional_result_prevents_artifact_creation() -> None:
 
     assert artifacts.created == []
     assert "run_functional_test" in model.seen[3][-1].content
+    failure_result = next(
+        item
+        for item in model.seen[1]
+        if isinstance(item, ToolResultMessage) and item.tool_name == "run_functional_test"
+    )
+    failure_payload = json.loads(failure_result.content)
+    assert failure_payload["passed"] is False
+    assert failure_payload["failed_cases"] == [{"index": 1, "name": "case"}]
+    assert "failed_source" not in failure_payload
+    submitted_source = next(
+        call.arguments["source"]
+        for item in model.seen[1]
+        if isinstance(item, AssistantMessage)
+        for call in item.tool_calls
+        if call.name == "run_functional_test"
+    )
+    assert submitted_source == source
+
+
+def test_functional_test_exception_result_omits_candidate_source() -> None:
+    source = _strategy_source()
+
+    class RaisingFunctionalTester:
+        async def run(self, candidate, *, requirements, model, options):
+            raise ValueError("测试用例构造失败")
+
+    model = ScriptedModel(
+        [
+            [ModelChunk(tool_calls=(ToolCall("run_functional_test", {"source": source}),))],
+            [ModelChunk(content="功能测试暂时失败。")],
+            [ModelChunk(content="本轮无法完成策略保存。")],
+        ]
+    )
+
+    with pytest.raises(AgentError):
+        collect(
+            AgentRunner(model, MemoryArtifacts(), functional_tester=RaisingFunctionalTester()),
+            message="生成策略",
+            history=[],
+            model="model-a",
+            account_id="alice",
+        )
+
+    failure_result = next(
+        item
+        for item in model.seen[1]
+        if isinstance(item, ToolResultMessage) and item.tool_name == "run_functional_test"
+    )
+    failure_payload = json.loads(failure_result.content)
+    assert failure_payload == {"error": "测试用例构造失败"}
+    submitted_source = next(
+        call.arguments["source"]
+        for item in model.seen[1]
+        if isinstance(item, AssistantMessage)
+        for call in item.tool_calls
+        if call.name == "run_functional_test"
+    )
+    assert submitted_source == source
 
 
 def test_unchanged_source_after_functional_failure_is_not_retested() -> None:
@@ -834,6 +909,22 @@ def test_unchanged_source_after_functional_failure_is_not_retested() -> None:
         isinstance(item, ToolResultMessage) and "failed_cases" in item.content
         for item in model.seen[2]
     )
+    replay_results = [
+        json.loads(item.content)
+        for item in model.seen[2]
+        if isinstance(item, ToolResultMessage) and item.tool_name == "run_functional_test"
+    ]
+    assert len(replay_results) == 2
+    assert all("failed_source" not in result for result in replay_results)
+    assert replay_results[-1]["failed_cases"]
+    submitted_sources = [
+        call.arguments["source"]
+        for item in model.seen[2]
+        if isinstance(item, AssistantMessage)
+        for call in item.tool_calls
+        if call.name == "run_functional_test"
+    ]
+    assert submitted_sources and all(candidate == source for candidate in submitted_sources)
     assert any(
         item.role == "user" and "逐笔按其中的 ticks" in item.content
         for item in model.seen[2]

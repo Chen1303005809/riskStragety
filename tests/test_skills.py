@@ -383,6 +383,7 @@ def test_skill_functional_tester_returns_failed_case_inputs() -> None:
     )
 
     assert result["passed"] is False
+    assert "failed_source" not in result
     assert result["failed_cases"] == [
         {
             "index": 1,

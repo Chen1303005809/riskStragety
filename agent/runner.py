@@ -42,7 +42,8 @@ MAX_UNSAVED_ARTIFACT_REPAIR_RETRIES = 3
 logger = logging.getLogger(__name__)
 TOOL_FAILURE_REPAIR_PROMPT = (
     "上一个工具结果包含 error 或 passed=false。请先检查该工具结果中的具体诊断，"
-    "功能检测失败时，以结果中的 failed_source 作为被测源码，直接修改它来修复失败原因；"
+    "功能检测失败时，使用紧邻上一个 run_functional_test 工具调用的 source 参数作为被测源码，"
+    "直接修改它来修复失败原因；"
     "若工具结果提示复用了之前的失败诊断，说明源码没有变化；必须先修改实现逻辑，"
     "不得只改注释或空白后重试，也不得原样返回失败源码。"
     "若功能检测结果包含 failed_cases，逐笔按其中的 ticks 推演源码状态变化，"
@@ -137,7 +138,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_functional_test",
-            "description": "按适用 Skill 和用户规则构造测试用例，并在 Python 3.12 隔离沙盒中运行候选源码。此前失败版本的 Python 语法树相同则复用上次失败用例，不重复运行沙盒，并要求先修改实现逻辑。失败时返回 failed_source（本次实际测试的完整源码）及失败用例诊断。",
+            "description": "按适用 Skill 和用户规则构造测试用例，并在 Python 3.12 隔离沙盒中运行候选源码。此前失败版本的 Python 语法树相同则复用上次失败用例，不重复运行沙盒，并要求先修改实现逻辑。失败时返回失败用例诊断；被测源码可从本次工具调用的 source 参数中读取。",
             "parameters": {
                 "type": "object",
                 "properties": {"source": {"type": "string", "description": "完整 Python 源码"}},
@@ -898,7 +899,6 @@ class AgentRunner:
                         )
                         result = {
                             **previous_failure,
-                            "failed_source": source,
                             "repeat_notice": (
                                 "源码语法树与此前失败版本相同，本次未重新运行沙盒；"
                                 "请按失败用例修改实现逻辑后再测试。"
@@ -949,8 +949,6 @@ class AgentRunner:
                         detail[:2_000],
                     )
                     result = {"error": detail}
-                    if call.name == "run_functional_test" and isinstance(source, str):
-                        result["failed_source"] = source
                     artifact = None
                 except Exception as exc:
                     await record_trace(
@@ -1248,7 +1246,9 @@ class AgentRunner:
                 validation.functional_passed.add(digest)
             else:
                 validation.functional_passed.discard(digest)
-                result = {**result, "failed_source": source}
+                result = {
+                    key: value for key, value in result.items() if key != "failed_source"
+                }
             return result, None
         if call.name == "write_generated_file":
             source = args.get("source")
