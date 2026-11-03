@@ -126,4 +126,51 @@ describe('chat page', () => {
     resolveChat(streamReply('等待完成。'));
     await screen.findByText('等待完成。');
   });
+
+  it('uploads an xlsx attachment, sends its ID, and keeps it visible in the session', async () => {
+    const attachmentId = 'b'.repeat(32);
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url === '/api/models') return Promise.resolve(Response.json({ models: ['model-a'], default_model: 'model-a' }));
+      if (url === '/api/agent/uploads') return Promise.resolve(Response.json({
+        attachment_id: attachmentId,
+        filename: 'risk.xlsx',
+        size_bytes: 5,
+        created_at: '2026-11-03T00:00:00Z',
+      }));
+      if (url === '/api/agent/chat/stream') return Promise.resolve(streamReply('已读取工作表。'));
+      throw new Error('unexpected URL: ' + url);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('button', { name: '策略对话' }));
+    fireEvent.change(screen.getByLabelText('账号 ID'), { target: { value: 'client-a' } });
+    fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'secret-key' } });
+    fireEvent.click(screen.getByText('连接并读取模型'));
+    await screen.findByText('从一条价格规则开始');
+
+    const workbook = new File(['xlsx'], 'risk.xlsx', {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    });
+    fireEvent.change(screen.getByLabelText('选择 Excel 文件'), { target: { files: [workbook] } });
+    await screen.findByText('risk.xlsx');
+    fireEvent.click(screen.getByRole('button', { name: '移除 risk.xlsx' }));
+    expect(screen.queryByText('待上传')).toBeNull();
+    fireEvent.change(screen.getByLabelText('选择 Excel 文件'), { target: { files: [workbook] } });
+    fireEvent.change(screen.getByLabelText('输入策略需求'), { target: { value: '读取工作簿' } });
+    fireEvent.click(screen.getByText(/发送需求/));
+    await screen.findByText('已读取工作表。');
+    await screen.findByText('本会话可引用的 Excel');
+
+    const uploadCall = fetchMock.mock.calls.find(([url]) => url === '/api/agent/uploads');
+    expect(uploadCall).toBeDefined();
+    const uploadInit = uploadCall?.[1] as RequestInit;
+    expect(uploadInit.headers).toEqual({ Authorization: 'Bearer secret-key' });
+    const uploadBody = uploadInit.body as FormData;
+    expect(uploadBody.get('account_id')).toBe('client-a');
+    expect((uploadBody.get('file') as File).name).toBe('risk.xlsx');
+
+    const chatCall = fetchMock.mock.calls.find(([url]) => url === '/api/agent/chat/stream');
+    expect(JSON.parse((chatCall?.[1] as RequestInit).body as string).attachment_ids).toEqual([attachmentId]);
+  });
 });

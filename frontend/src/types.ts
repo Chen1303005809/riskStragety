@@ -33,6 +33,7 @@ export interface ChatRequest {
   model?: string;
   options: ModelOptions;
   think: boolean;
+  attachment_ids?: string[];
 }
 
 export interface DoneEvent {
@@ -74,6 +75,13 @@ export interface ArtifactRecord extends Artifact {
   created_at: string;
 }
 
+export interface ExcelAttachment {
+  attachment_id: string;
+  filename: string;
+  size_bytes: number;
+  created_at?: string;
+}
+
 export interface MonitorConversationsPage extends Page<ConversationSummary> {
   unassigned_artifacts: ArtifactRecord[];
   unassigned_offset: number;
@@ -99,4 +107,5 @@ export interface ConversationDetail {
   artifact_offset: number;
   artifact_limit: number;
   artifact_total: number;
+  excel_attachments: ExcelAttachment[];
 }

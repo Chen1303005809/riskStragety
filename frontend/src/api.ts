@@ -6,6 +6,7 @@ import type {
   ConversationDetail,
   ConversationSummary,
   DoneEvent,
+  ExcelAttachment,
   MonitorConversationsPage,
   ModelProvider,
   Page,
@@ -96,6 +97,24 @@ async function jsonResponse<T>(response: Response): Promise<T> {
   return await response.json() as T;
 }
 
+export async function uploadExcelFile(
+  apiKey: string,
+  accountId: string,
+  file: File,
+  signal?: AbortSignal,
+): Promise<ExcelAttachment> {
+  const form = new FormData();
+  form.append('account_id', accountId);
+  form.append('file', file, file.name);
+  const response = await fetch('/api/agent/uploads', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + apiKey },
+    body: form,
+    signal,
+  });
+  return jsonResponse<ExcelAttachment>(response);
+}
+
 export async function fetchMonitorAccounts(
   apiKey: string,
   offset = 0,
@@ -150,7 +169,12 @@ export async function fetchConversationForChat(
   apiKey: string,
   accountId: string,
   conversationId: string,
-): Promise<{ conversation: ConversationSummary; messages: ConversationDetail['messages']; artifacts: ArtifactRecord[] }> {
+): Promise<{
+  conversation: ConversationSummary;
+  messages: ConversationDetail['messages'];
+  artifacts: ArtifactRecord[];
+  excelAttachments: ExcelAttachment[];
+}> {
   const first = await fetchMonitorConversation(apiKey, accountId, conversationId, {
     messageOffset: 0,
     messageLimit: 200,
@@ -175,7 +199,12 @@ export async function fetchConversationForChat(
     });
     artifacts.push(...page.artifacts);
   }
-  return { conversation: first.conversation, messages, artifacts };
+  return {
+    conversation: first.conversation,
+    messages,
+    artifacts,
+    excelAttachments: first.excel_attachments || [],
+  };
 }
 
 function handleFrame(frame: string, callbacks: StreamCallbacks): boolean {

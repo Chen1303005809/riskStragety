@@ -128,6 +128,21 @@ class FunctionalTester(Protocol):
     ) -> dict[str, Any]: ...
 
 
+class ExcelWorkbookReader(Protocol):
+    async def list_files(
+        self, account_id: str, conversation_id: str | None
+    ) -> list[dict[str, Any]]: ...
+
+    async def read_workbook(
+        self,
+        account_id: str,
+        conversation_id: str | None,
+        attachment_id: str,
+        sheet_name: str | None = None,
+        cell_range: str | None = None,
+    ) -> dict[str, Any]: ...
+
+
 class ConversationRecorder(Protocol):
     async def record(
         self,

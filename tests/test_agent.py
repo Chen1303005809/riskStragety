@@ -350,7 +350,10 @@ def test_runner_preserves_unique_provider_call_ids_and_pairs_results() -> None:
 
 def test_tool_schemas_expose_skills_but_no_static_or_interface_readers() -> None:
     tool_names = {tool["function"]["name"] for tool in TOOL_SCHEMAS}
-    assert {"list_skills", "load_skill", "run_functional_test", "write_generated_file"} <= tool_names
+    assert {
+        "list_skills", "load_skill", "list_excel_files", "read_excel",
+        "run_functional_test", "write_generated_file",
+    } <= tool_names
     assert not {
         "check_python_syntax",
         "list_interface_files",

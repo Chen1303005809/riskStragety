@@ -6,16 +6,16 @@
 
 | 目录 | 职责 |
 | --- | --- |
-| `frontend/` | React 页面；`src/api.ts` 集中处理 HTTP、SSE、预览和下载请求。服务 Bearer Key 与账号 ID 只在页面内存中。 |
-| `backend/` | FastAPI 路由、Bearer 认证、在线模型服务配置、请求校验、SSE 映射和适配器装配。 |
+| `frontend/` | React 页面；`src/api.ts` 集中处理 HTTP、SSE、上传、预览和下载请求。服务 Bearer Key 与账号 ID 只在页面内存中。 |
+| `backend/` | FastAPI 路由、Bearer 认证、在线模型服务配置、请求校验、SSE 映射和适配器装配；支持按会话保存并只读解析 `.xlsx`。 |
 | `agent/` | 通用会话提示词、可发现的 Skill 包、按轮次添加上海日期、历史消息组织和有上限的工具调用循环。无 FastAPI 依赖。 |
 | `interfaces/价格接口/` | 从旧项目迁入的 Python 接口源码。Agent 不读取源码；功能测试沙盒以只读方式加载运行测试所需接口。 |
 | `artifacts/` | 生成的 Python 源码及迁移前遗留的 JSON 元数据。新产物归属和会话索引写入 SQLite。 |
-| `data/` | 默认数据目录，保存账号、会话、消息、产物索引、DeepSeek Key 配置和会话交互日志；可由 `APP_DATA_DIR` 调整。 |
+| `data/` | 默认数据目录，保存账号、会话、消息、产物索引、DeepSeek Key 配置、会话交互日志和会话 Excel 文件；可由 `APP_DATA_DIR` 调整。 |
 
 `AgentRunner.run(...)` 是后端调用 Agent 的边界，返回异步业务事件。模型、功能测试器、Skill loader 和产物存储都经接口注入。共享 Bearer API Key 负责认证，账号 ID 负责数据归属，不是身份凭证；持有共享 Key 的调用方可以查看所有账号的监控数据。聊天时第一次使用的账号 ID（去除首尾空白后）和 UUID 会创建账号及会话，会话绑定账号且不能转移。服务端从 SQLite 恢复对话历史，并把用户消息、Agent 回复和文件关联持久化。网页的监控总览可浏览账号、会话、消息和生成文件。
 
-每个会话还会在 `APP_DATA_DIR/conversation_logs/<account_id>/<conversation_id>.jsonl`（默认 `data/conversation_logs/`）追加完整交互日志。同一账号的会话日志放在一起；所有以 `guest` 开头的账号共用 `guest/` 目录。日志包含每轮开始时的历史和用户消息、发送给主模型及功能检测模型的 system/user/assistant/tool 上下文、模型回复片段、工具调用参数与结果、沙盒用例和结果，以及完成、失败或中断状态。每条记录独立为一行 JSON；同一会话续聊时追加到原文件，每条记录都包含账号 ID。日志目录权限为 `0700`，文件权限为 `0600`。
+每个会话还会在 `APP_DATA_DIR/conversation_logs/<account_id>/<conversation_id>.jsonl`（默认 `data/conversation_logs/`）追加交互日志。同一账号的会话日志放在一起；所有以 `guest` 开头的账号共用 `guest/` 目录。一般会话日志记录模型上下文和工具结果；含有 Excel 附件的会话会隐藏消息与工具内容，只记录操作元数据，不记录单元格值。每条记录独立为一行 JSON；同一会话续聊时追加到原文件，每条记录都包含账号 ID。日志目录权限为 `0700`，文件权限为 `0600`。
 
 账号、会话和文件监控的实施路线见[真实账号与会话监控功能计划](docs/monitoring-feature-plan.md)。
 
@@ -44,7 +44,7 @@ cp .env.example .env
 .venv/bin/python3.12 -m backend
 ```
 
-在浏览器打开 `http://<服务所在主机>:8765/`，进入“监控总览”并输入服务 API Key 查看全部账号；进入“策略对话”后输入账号 ID，并选择 Ollama 或 DeepSeek。首次使用 DeepSeek 时，可在连接表单填写 DeepSeek API Key；连接后也可在“模型参数”面板保存、替换或清除 Key。服务端会验证 Key 并将其保存在 `APP_DATA_DIR/provider_settings.sqlite3`（默认 `data/provider_settings.sqlite3`），数据库文件权限限制为仅服务进程用户可读写，Key 不会返回到网页。前端开发时，在两个终端分别启动后端和 `cd frontend && npm run dev`；Vite 会将 `/api` 代理到本机的 8765 端口。生产部署时，请限制服务仅在可信局域网可达；跨网访问可在前面加 HTTPS 反向代理。
+在浏览器打开 `http://<服务所在主机>:8765/`，进入“监控总览”并输入服务 API Key 查看全部账号；进入“策略对话”后输入账号 ID，并选择 Ollama 或 DeepSeek。聊天框可上传 `.xlsx` 文件，单个文件最大 20 MiB；上传后归属于当前会话，未发送的临时上传会在 24 小时后清理。首次使用 DeepSeek 时，可在连接表单填写 DeepSeek API Key；连接后也可在“模型参数”面板保存、替换或清除 Key。服务端会验证 Key 并将其保存在 `APP_DATA_DIR/provider_settings.sqlite3`（默认 `data/provider_settings.sqlite3`），数据库文件权限限制为仅服务进程用户可读写，Key 不会返回到网页。前端开发时，在两个终端分别启动后端和 `cd frontend && npm run dev`；Vite 会将 `/api` 代理到本机的 8765 端口。生产部署时，请限制服务仅在可信局域网可达；跨网访问可在前面加 HTTPS 反向代理。
 
 ## HTTP 接口
 
@@ -70,6 +70,10 @@ curl -N http://127.0.0.1:8765/api/agent/chat/stream \
 | `artifact` | `artifact_id`、`filename`，表示文件已保存。 |
 | `done` | 完整 `content`、`model`、本轮 `artifacts`、`usage`、`ErrCode`、`ErrMsg`。有本轮产物时 `ErrCode` 为 `ok`；缺少必要参数并追问时返回 `needs_input`。 |
 | `error` | `ErrCode`、`ErrMsg`；模型、Agent 或工具运行失败，以及 Agent 流提前结束。 |
+
+先将工作簿上传到 `POST /api/agent/uploads`，使用 multipart 字段 `account_id` 和 `file`。接口返回 `attachment_id`；聊天 JSON 可带可选的 `attachment_ids`（最多 100 个），首次引用时文件会绑定到该账号和会话，后续轮次可继续使用；网页每轮最多选择 5 个新文件。仅接受未加密 `.xlsx`；不执行宏、不重新计算公式。Agent 通过 `list_excel_files` 查看本会话文件，通过 `read_excel` 查看工作簿表单和指定工作表范围；省略范围时最多读取前 50 行、20 列，单次不超过 1,000 个单元格。公式单元格同时返回缓存值和公式；没有缓存值时返回公式文本。
+
+Excel 内容会传给本轮选择的模型服务处理。使用 DeepSeek 时，界面会提示读取到的单元格内容将发送至 DeepSeek；使用 Ollama 时由所选的本地模型处理。
 
 只有最终的 `done` 或 `error` 事件带 `ErrCode`、`ErrMsg`。`done` 的两个字段与 `content` 同级；HTTP 错误响应也在 JSON 顶层返回这两个字段，并保留 `detail`，其内容与 `ErrMsg` 一致。错误消息为固定客户端文案，不包含上游异常原文。
 
@@ -106,7 +110,7 @@ curl -N http://127.0.0.1:8765/api/agent/chat/stream \
 | `GET /api/monitor/accounts/{account_id}/conversations?offset=0&limit=50` | 返回会话摘要及未关联会话的旧文件列表。 |
 | `GET /api/monitor/accounts/{account_id}/conversations/{conversation_id}` | 按序分页返回消息，并分页返回会话文件详情。 |
 
-列表按更新时间和稳定 ID 排序；会话详情可用 `message_offset`、`message_limit`、`artifact_offset` 和 `artifact_limit` 分页。服务启动时会把旧的 `artifacts/<artifact_id>.json` 元数据导入 SQLite；没有会话 ID 的文件留在账号的“未关联会话文件”区域，原始文件不会被迁移删除。
+列表按更新时间和稳定 ID 排序；会话详情可用 `message_offset`、`message_limit`、`artifact_offset` 和 `artifact_limit` 分页，并返回会话 Excel 附件列表。服务启动时会把旧的 `artifacts/<artifact_id>.json` 元数据导入 SQLite；没有会话 ID 的文件留在账号的“未关联会话文件”区域，原始文件不会被迁移删除。
 
 ```bash
 curl http://127.0.0.1:8765/api/models \

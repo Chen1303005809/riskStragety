@@ -53,10 +53,27 @@ SCHEMA_V1 = (
     "CREATE INDEX artifacts_conversation_created ON artifacts(conversation_id, created_at DESC, artifact_id ASC)",
     "CREATE TABLE monitoring_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 )
+SCHEMA_V2 = (
+    """CREATE TABLE excel_uploads (
+        attachment_id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL REFERENCES accounts(account_id),
+        conversation_id TEXT REFERENCES conversations(conversation_id),
+        filename TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+        created_at TEXT NOT NULL,
+        expires_at TEXT
+    )""",
+    "CREATE INDEX excel_uploads_conversation ON excel_uploads(account_id, conversation_id, created_at)",
+    "CREATE INDEX excel_uploads_expiry ON excel_uploads(conversation_id, expires_at)",
+)
 
 
 class ConversationNotFound(LookupError):
     """The conversation does not exist for the requested account."""
+
+
+class ExcelAttachmentNotFound(LookupError):
+    """The uploaded workbook is unavailable to the requested account or conversation."""
 
 
 class AccountNotFound(LookupError):
@@ -103,11 +120,190 @@ class MonitoringStore:
             if version < 1:
                 for statement in SCHEMA_V1:
                     connection.execute(statement)
-                connection.execute("PRAGMA user_version = 1")
-            elif version != 1:
+                version = 1
+            if version == 1:
+                for statement in SCHEMA_V2:
+                    connection.execute(statement)
+                connection.execute("PRAGMA user_version = 2")
+            elif version != 2:
                 connection.rollback()
                 raise RuntimeError(f"不支持的监控数据库版本：{version}")
             connection.commit()
+
+    async def register_excel_upload(
+        self,
+        attachment_id: str,
+        account_id: str,
+        filename: str,
+        size_bytes: int,
+        expires_at: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._register_excel_upload,
+            attachment_id,
+            account_id,
+            filename,
+            size_bytes,
+            expires_at,
+        )
+
+    def _register_excel_upload(
+        self,
+        attachment_id: str,
+        account_id: str,
+        filename: str,
+        size_bytes: int,
+        expires_at: str,
+    ) -> dict[str, Any]:
+        now = _now()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT OR IGNORE INTO accounts(account_id, created_at, updated_at) VALUES (?, ?, ?)",
+                (account_id, now, now),
+            )
+            connection.execute(
+                """INSERT INTO excel_uploads
+                   (attachment_id, account_id, filename, size_bytes, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (attachment_id, account_id, filename, size_bytes, now, expires_at),
+            )
+            connection.execute(
+                "UPDATE accounts SET updated_at = ? WHERE account_id = ?", (now, account_id)
+            )
+            connection.commit()
+        return {
+            "attachment_id": attachment_id,
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "created_at": now,
+        }
+
+    async def bind_excel_uploads(
+        self, account_id: str, conversation_id: str, attachment_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._bind_excel_uploads, account_id, conversation_id, attachment_ids
+        )
+
+    def _bind_excel_uploads(
+        self, account_id: str, conversation_id: str, attachment_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        now = _now()
+        ids = list(dict.fromkeys(attachment_ids))
+        if not ids:
+            return []
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            conversation = connection.execute(
+                "SELECT account_id FROM conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if not conversation or conversation["account_id"] != account_id:
+                connection.rollback()
+                raise ConversationNotFound(conversation_id)
+            bound: list[dict[str, Any]] = []
+            for attachment_id in ids:
+                row = connection.execute(
+                    """SELECT attachment_id, account_id, conversation_id, filename, size_bytes,
+                              created_at, expires_at
+                       FROM excel_uploads WHERE attachment_id = ?""",
+                    (attachment_id,),
+                ).fetchone()
+                if (
+                    not row
+                    or row["account_id"] != account_id
+                    or (row["conversation_id"] is not None and row["conversation_id"] != conversation_id)
+                    or (
+                        row["conversation_id"] is None
+                        and row["expires_at"] is not None
+                        and row["expires_at"] <= now
+                    )
+                ):
+                    connection.rollback()
+                    raise ExcelAttachmentNotFound(attachment_id)
+                if row["conversation_id"] is None:
+                    connection.execute(
+                        "UPDATE excel_uploads SET conversation_id = ?, expires_at = NULL WHERE attachment_id = ?",
+                        (conversation_id, attachment_id),
+                    )
+                bound.append({
+                    "attachment_id": row["attachment_id"],
+                    "filename": row["filename"],
+                    "size_bytes": int(row["size_bytes"]),
+                    "created_at": row["created_at"],
+                })
+            connection.commit()
+        return bound
+
+    async def list_excel_uploads(
+        self, account_id: str, conversation_id: str
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_excel_uploads, account_id, conversation_id)
+
+    def _list_excel_uploads(self, account_id: str, conversation_id: str) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            conversation = connection.execute(
+                "SELECT account_id FROM conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if not conversation or conversation["account_id"] != account_id:
+                raise ConversationNotFound(conversation_id)
+            rows = connection.execute(
+                """SELECT attachment_id, filename, size_bytes, created_at
+                   FROM excel_uploads
+                   WHERE account_id = ? AND conversation_id = ?
+                   ORDER BY created_at ASC, attachment_id ASC""",
+                (account_id, conversation_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def excel_upload_for_conversation(
+        self, account_id: str, conversation_id: str, attachment_id: str
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._excel_upload_for_conversation, account_id, conversation_id, attachment_id
+        )
+
+    def _excel_upload_for_conversation(
+        self, account_id: str, conversation_id: str, attachment_id: str
+    ) -> dict[str, Any]:
+        with closing(self._connect()) as connection:
+            conversation = connection.execute(
+                "SELECT account_id FROM conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if not conversation or conversation["account_id"] != account_id:
+                raise ConversationNotFound(conversation_id)
+            row = connection.execute(
+                """SELECT attachment_id, filename, size_bytes, created_at
+                   FROM excel_uploads
+                   WHERE attachment_id = ? AND account_id = ? AND conversation_id = ?""",
+                (attachment_id, account_id, conversation_id),
+            ).fetchone()
+            if not row:
+                raise ExcelAttachmentNotFound(attachment_id)
+        return dict(row)
+
+    async def purge_expired_excel_uploads(self, now: str | None = None) -> list[str]:
+        return await asyncio.to_thread(self._purge_expired_excel_uploads, now or _now())
+
+    def _purge_expired_excel_uploads(self, now: str) -> list[str]:
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """SELECT attachment_id FROM excel_uploads
+                   WHERE conversation_id IS NULL AND expires_at IS NOT NULL AND expires_at <= ?""",
+                (now,),
+            ).fetchall()
+            ids = [str(row["attachment_id"]) for row in rows]
+            if ids:
+                connection.executemany(
+                    "DELETE FROM excel_uploads WHERE attachment_id = ?",
+                    [(attachment_id,) for attachment_id in ids],
+                )
+            connection.commit()
+        return ids
 
     def _import_legacy_artifacts(self) -> None:
         if self._artifact_directory.is_symlink() or not self._artifact_directory.is_dir():
@@ -499,6 +695,12 @@ class MonitoringStore:
                    WHERE conversation_id = ? ORDER BY created_at DESC, artifact_id ASC LIMIT ? OFFSET ?""",
                 (conversation_id, artifact_limit, artifact_offset),
             ).fetchall()
+            excel_attachments = connection.execute(
+                """SELECT attachment_id, filename, size_bytes, created_at
+                   FROM excel_uploads WHERE account_id = ? AND conversation_id = ?
+                   ORDER BY created_at ASC, attachment_id ASC""",
+                (account_id, conversation_id),
+            ).fetchall()
         return {
             "conversation": dict(conversation),
             "messages": [dict(row) for row in messages],
@@ -509,4 +711,5 @@ class MonitoringStore:
             "artifact_offset": artifact_offset,
             "artifact_limit": artifact_limit,
             "artifact_total": artifact_total,
+            "excel_attachments": [dict(row) for row in excel_attachments],
         }

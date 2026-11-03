@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator
+
+
+ATTACHMENT_ID_PATTERN = r"^[0-9a-f]{32}$"
 
 
 class ModelOptions(BaseModel):
@@ -31,6 +35,7 @@ class ChatRequest(BaseModel):
     model: str | None = Field(default=None, min_length=1, max_length=256)
     options: ModelOptions = Field(default_factory=ModelOptions)
     think: StrictBool = False
+    attachment_ids: list[StrictStr] = Field(default_factory=list, max_length=100)
 
     @field_validator("account_id")
     @classmethod
@@ -39,6 +44,16 @@ class ChatRequest(BaseModel):
         if not normalized:
             raise ValueError("account_id must not be blank")
         return normalized
+
+    @field_validator("attachment_ids")
+    @classmethod
+    def validate_attachment_ids(cls, values: list[str]) -> list[str]:
+        if len(set(values)) != len(values) or any(
+            re.fullmatch(ATTACHMENT_ID_PATTERN, value) is None
+            for value in values
+        ):
+            raise ValueError("attachment_ids must contain unique Excel attachment IDs")
+        return values
 
 
 class DeepSeekKeyRequest(BaseModel):

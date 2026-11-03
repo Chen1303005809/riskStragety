@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { FormEvent, KeyboardEvent } from 'react';
+import type { ChangeEvent, FormEvent, KeyboardEvent } from 'react';
 import {
   decodeArtifactSource,
   fetchArtifact,
@@ -12,6 +12,7 @@ import {
   removeDeepSeekApiKey,
   saveDeepSeekApiKey,
   streamChat,
+  uploadExcelFile,
 } from './api';
 import type {
   AccountSummary,
@@ -20,6 +21,7 @@ import type {
   ChatMessage,
   ConversationDetail,
   ConversationSummary,
+  ExcelAttachment,
   ModelOptions,
   ModelProvider,
   MonitorConversationsPage,
@@ -27,6 +29,8 @@ import type {
 } from './types';
 
 const QWEN38_MAX_CONTEXT_TOKENS = 262_144;
+const MAX_EXCEL_UPLOAD_BYTES = 20 * 1024 * 1024;
+const MAX_EXCEL_FILES_PER_TURN = 5;
 
 function isQwen38Model(model: string): boolean {
   return model.toLowerCase().startsWith('qwen3.8');
@@ -78,6 +82,8 @@ function activityText(phase: string, tool?: string): string {
     if (tool === 'load_skill') return '正在加载任务说明…';
     if (tool === 'run_functional_test') return '正在运行功能测试…';
     if (tool === 'write_generated_file') return '正在保存策略文件…';
+    if (tool === 'list_excel_files') return '正在查看本会话的 Excel 文件…';
+    if (tool === 'read_excel') return '正在读取 Excel 工作表…';
     return '正在使用工具…';
   }
   return '正在生成回复…';
@@ -465,12 +471,16 @@ export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const messagesRef = useRef<ChatMessage[]>([]);
   const [draft, setDraft] = useState('');
+  const [pendingExcelFiles, setPendingExcelFiles] = useState<File[]>([]);
+  const [sessionExcelFiles, setSessionExcelFiles] = useState<ExcelAttachment[]>([]);
+  const [unboundExcelIds, setUnboundExcelIds] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [activity, setActivity] = useState('');
   const [notice, setNotice] = useState('');
   const [preview, setPreview] = useState<{ artifact: Artifact; source: string; accountId: string } | null>(null);
   const [artifactBusy, setArtifactBusy] = useState('');
   const abortRef = useRef<AbortController | null>(null);
+  const excelInputRef = useRef<HTMLInputElement | null>(null);
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const selectedModelUsesQwen38Context = provider === 'ollama' && isQwen38Model(model);
 
@@ -481,6 +491,31 @@ export default function App() {
 
   function updateAssistant(id: string, change: Partial<ChatMessage>) {
     commitMessages(messagesRef.current.map((item) => item.id === id ? { ...item, ...change } : item));
+  }
+
+  function addExcelFiles(event: ChangeEvent<HTMLInputElement>) {
+    const selected = Array.from(event.currentTarget.files || []);
+    event.currentTarget.value = '';
+    const available = MAX_EXCEL_FILES_PER_TURN - pendingExcelFiles.length;
+    const accepted: File[] = [];
+    let rejectedReason = '';
+    for (const file of selected) {
+      if (!file.name.toLowerCase().endsWith('.xlsx')) {
+        rejectedReason = '仅支持 .xlsx 文件';
+      } else if (file.size > MAX_EXCEL_UPLOAD_BYTES) {
+        rejectedReason = '单个 Excel 文件不能超过 20 MiB';
+      } else if (accepted.length >= available) {
+        rejectedReason = `每轮最多添加 ${MAX_EXCEL_FILES_PER_TURN} 个 Excel 文件`;
+      } else {
+        accepted.push(file);
+      }
+    }
+    if (accepted.length) setPendingExcelFiles((current) => [...current, ...accepted]);
+    if (rejectedReason) setNotice(rejectedReason);
+  }
+
+  function removePendingExcelFile(index: number) {
+    setPendingExcelFiles((current) => current.filter((_, fileIndex) => fileIndex !== index));
   }
 
   function updateModelOption(key: keyof ModelOptions, raw: string) {
@@ -527,6 +562,9 @@ export default function App() {
       setDeepseekConfigured(result.deepseekConfigured || provider === 'deepseek');
       setAccountId(account);
       setAccountIdDraft('');
+      setPendingExcelFiles([]);
+      setSessionExcelFiles([]);
+      setUnboundExcelIds([]);
       setModels(names);
       setModel(names.includes(defaultModel) ? defaultModel : names[0]);
     } catch (error) {
@@ -546,6 +584,9 @@ export default function App() {
     setProvider('ollama');
     setConversationId(createUuid());
     setPreview(null);
+    setPendingExcelFiles([]);
+    setSessionExcelFiles([]);
+    setUnboundExcelIds([]);
     commitMessages([]);
     setNotice('');
   }
@@ -609,28 +650,52 @@ export default function App() {
     commitMessages([]);
     setConversationId(createUuid());
     setPreview(null);
+    setPendingExcelFiles([]);
+    setSessionExcelFiles([]);
+    setUnboundExcelIds([]);
     setNotice('');
   }
 
   async function send(event?: FormEvent) {
     event?.preventDefault();
-    const message = draft.trim();
+    const message = draft.trim() || (pendingExcelFiles.length ? '请读取我上传的 Excel 文件' : '');
     if (provider === 'deepseek' && !deepseekConfigured) {
       setNotice('请先配置 DeepSeek API Key');
       return;
     }
     if (!apiKey || !model || !message || busy) return;
-    const user = makeMessage('user', message, 'complete');
-    const assistant = makeMessage('assistant', '', 'streaming');
-    commitMessages([...messagesRef.current, user, assistant]);
-    setDraft('');
+    const filesToUpload = [...pendingExcelFiles];
     setBusy(true);
     setNotice('');
-    setActivity('正在理解需求…');
+    setActivity(filesToUpload.length ? '正在上传 Excel 文件…' : '正在理解需求…');
     const controller = new AbortController();
     abortRef.current = controller;
+    let assistantId: string | null = null;
 
     try {
+      const uploadedAttachments: ExcelAttachment[] = [];
+      for (const file of filesToUpload) {
+        uploadedAttachments.push(await uploadExcelFile(apiKey, accountId, file, controller.signal));
+      }
+      if (uploadedAttachments.length) {
+        setSessionExcelFiles((current) => {
+          const byId = new Map(current.map((item) => [item.attachment_id, item]));
+          uploadedAttachments.forEach((item) => byId.set(item.attachment_id, item));
+          return [...byId.values()];
+        });
+        setUnboundExcelIds((current) => [...new Set([
+          ...current,
+          ...uploadedAttachments.map((item) => item.attachment_id),
+        ])]);
+        setPendingExcelFiles([]);
+      }
+
+      const user = makeMessage('user', message, 'complete');
+      const assistant = makeMessage('assistant', '', 'streaming');
+      assistantId = assistant.id;
+      commitMessages([...messagesRef.current, user, assistant]);
+      setDraft('');
+      setActivity('正在理解需求…');
       await streamChat(apiKey, {
         account_id: accountId,
         conversation_id: conversationId,
@@ -639,6 +704,10 @@ export default function App() {
         model,
         options: modelOptions,
         think,
+        attachment_ids: [...new Set([
+          ...unboundExcelIds,
+          ...uploadedAttachments.map((item) => item.attachment_id),
+        ])],
       }, {
         onStatus: (phase, tool) => setActivity(activityText(phase, tool)),
         onDelta: (text) => {
@@ -663,14 +732,19 @@ export default function App() {
           }
         },
       }, controller.signal);
+      setUnboundExcelIds([]);
     } catch (error) {
       const stopped = controller.signal.aborted;
-      const previousContent = messagesRef.current.find((item) => item.id === assistant.id)?.content || '';
+      const previousContent = assistantId
+        ? messagesRef.current.find((item) => item.id === assistantId)?.content || ''
+        : '';
       const failure = error instanceof Error ? error.message : '生成失败，请重试。';
-      updateAssistant(assistant.id, {
-        status: stopped ? 'stopped' : 'error',
-        content: previousContent || (stopped ? '已停止本轮生成。' : '生成失败：' + failure),
-      });
+      if (assistantId) {
+        updateAssistant(assistantId, {
+          status: stopped ? 'stopped' : 'error',
+          content: previousContent || (stopped ? '已停止本轮生成。' : '生成失败：' + failure),
+        });
+      }
       if (!stopped) setNotice('生成失败：' + failure);
     } finally {
       abortRef.current = null;
@@ -764,6 +838,9 @@ export default function App() {
       setModels(availableModels);
       setModel(selectedModel);
       setConversationId(selectedConversationId);
+      setPendingExcelFiles([]);
+      setSessionExcelFiles(restored.excelAttachments);
+      setUnboundExcelIds([]);
       commitMessages(restoredMessages);
       setPreview(null);
       setDraft('');
@@ -1016,17 +1093,52 @@ export default function App() {
                 value={draft}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={onComposerKeyDown}
-                placeholder="描述预警规则，或继续调整上一版策略…"
+                placeholder="描述预警规则、上传 Excel 供 Agent 读取，或继续调整上一版策略…"
                 rows={3}
                 disabled={busy}
                 aria-label="输入策略需求"
               />
+              {sessionExcelFiles.length > 0 && <div className="excel-file-list">
+                <span>本会话可引用的 Excel</span>
+                {sessionExcelFiles.map((file) => (
+                  <div className="excel-file-chip" key={file.attachment_id}>
+                    <span className="excel-file-mark">XLSX</span>
+                    <strong title={file.filename}>{file.filename}</strong>
+                  </div>
+                ))}
+              </div>}
+              {pendingExcelFiles.length > 0 && <div className="excel-file-list pending">
+                <span>待上传</span>
+                {pendingExcelFiles.map((file, index) => (
+                  <div className="excel-file-chip" key={`${file.name}-${index}`}>
+                    <span className="excel-file-mark">XLSX</span>
+                    <strong title={file.name}>{file.name}</strong>
+                    <button type="button" aria-label={`移除 ${file.name}`} onClick={() => removePendingExcelFile(index)} disabled={busy}>×</button>
+                  </div>
+                ))}
+              </div>}
+              {provider === 'deepseek' && (sessionExcelFiles.length > 0 || pendingExcelFiles.length > 0) && (
+                <p className="excel-provider-notice">使用 DeepSeek 时，Agent 读取到的单元格内容会发送至 DeepSeek。</p>
+              )}
+              <input
+                ref={excelInputRef}
+                className="excel-file-input"
+                type="file"
+                accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                multiple
+                onChange={addExcelFiles}
+                disabled={busy}
+                aria-label="选择 Excel 文件"
+              />
               <div className="composer-footer">
-                <span>Enter 发送 · Shift + Enter 换行</span>
+                <div className="composer-tools">
+                  <button className="excel-upload-button" type="button" onClick={() => excelInputRef.current?.click()} disabled={busy || pendingExcelFiles.length >= MAX_EXCEL_FILES_PER_TURN}>添加 Excel</button>
+                  <span>仅支持 .xlsx，单个文件不超过 20 MiB；每轮最多 5 个</span>
+                </div>
                 {busy ? (
                   <button className="stop-button" type="button" onClick={() => abortRef.current?.abort()}>停止</button>
                 ) : (
-                  <button className="send-button" type="submit" disabled={!draft.trim()}>发送需求 <span aria-hidden="true">↗</span></button>
+                  <button className="send-button" type="submit" disabled={!draft.trim() && pendingExcelFiles.length === 0}>发送需求 <span aria-hidden="true">↗</span></button>
                 )}
               </div>
             </form>

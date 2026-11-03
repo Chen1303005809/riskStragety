@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -24,10 +24,16 @@ from agent.runner import AgentRunner
 from agent.skills import FilesystemSkillLoader
 from backend.adapters.conversation_logs import ConversationLogStore
 from backend.adapters.files import IndexedArtifactWriter, LocalArtifactStore
+from backend.adapters.excel_files import (
+    MAX_EXCEL_UPLOAD_BYTES,
+    ExcelFileError,
+    ExcelFileStore,
+)
 from backend.adapters.provider_settings import ProviderSettingsStore
 from backend.adapters.monitoring import (
     AccountNotFound,
     ConversationNotFound,
+    ExcelAttachmentNotFound,
     MonitoringStore,
 )
 from backend.adapters.sandbox import DockerFunctionalSandbox
@@ -52,6 +58,9 @@ ERROR_MESSAGES = {
     "conversation_not_found": "会话不存在",
     "account_not_found": "账号不存在",
     "artifact_not_found": "产物不存在",
+    "excel_file_invalid": "Excel 文件无效或格式不受支持，请上传未加密的 .xlsx 文件",
+    "excel_file_too_large": "Excel 文件超过 20 MiB 限制",
+    "excel_attachment_not_found": "Excel 文件不存在或不属于当前会话",
     "model_service_unavailable": "模型服务暂不可用，请稍后重试",
     "agent_incomplete": "本轮生成未正常结束，请重试",
     "agent_failed": "本轮处理失败，请稍后重试",
@@ -153,6 +162,7 @@ def create_app(
     model = model_gateway or OllamaModelGateway(config.ollama_base_url)
     artifacts = artifact_store or LocalArtifactStore(config.project_root / "artifacts")
     monitoring = MonitoringStore(config.data_dir / "monitoring.sqlite3", artifacts.directory)
+    excel_files = ExcelFileStore(config.data_dir / "excel_uploads", monitoring)
     conversation_logs = ConversationLogStore(config.data_dir / "conversation_logs")
     provider_settings = ProviderSettingsStore(config.data_dir / "provider_settings.sqlite3")
     interface_directory = config.project_root / "interfaces" / "价格接口"
@@ -169,6 +179,7 @@ def create_app(
             artifact_writer,
             functional_tester=selected_tester,
             skill_loader=skill_loader,
+            excel_reader=excel_files,
         )
 
     runner = agent_runner or build_runner(model)
@@ -176,7 +187,24 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        yield
+        await excel_files.purge_expired()
+        async def cleanup_expired_uploads() -> None:
+            while True:
+                await asyncio.sleep(60 * 60)
+                try:
+                    await excel_files.purge_expired()
+                except Exception:
+                    logger.exception("excel_upload_cleanup_failed")
+
+        cleanup_task = asyncio.create_task(cleanup_expired_uploads())
+        try:
+            yield
+        finally:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
         close = getattr(model, "close", None)
         if close is not None:
             await close()
@@ -184,6 +212,7 @@ def create_app(
     app = FastAPI(title="风控策略 Agent", lifespan=lifespan)
     app.state.settings = config
     app.state.monitoring = monitoring
+    app.state.excel_files = excel_files
     app.state.conversation_logs = conversation_logs
     app.state.provider_settings = provider_settings
 
@@ -221,6 +250,31 @@ def create_app(
             allow_methods=["GET", "POST", "PUT", "DELETE"],
             allow_headers=["Authorization", "Content-Type"],
         )
+
+    @app.post("/api/agent/uploads")
+    async def upload_excel(
+        account_id: str = Form(...),
+        file: UploadFile = File(...),
+        _: Principal = Depends(require_principal),
+    ) -> dict[str, object]:
+        normalized_account_id = account_id.strip()
+        if not normalized_account_id or len(normalized_account_id) > 128:
+            raise MappedHTTPException(422, "request_invalid")
+        try:
+            content = await file.read(MAX_EXCEL_UPLOAD_BYTES + 1)
+            if len(content) > MAX_EXCEL_UPLOAD_BYTES:
+                raise MappedHTTPException(413, "excel_file_too_large")
+            return await excel_files.save_upload(
+                normalized_account_id,
+                file.filename or "",
+                content,
+            )
+        except ExcelFileError as exc:
+            if "20 MiB" in str(exc):
+                raise MappedHTTPException(413, "excel_file_too_large") from exc
+            raise MappedHTTPException(400, "excel_file_invalid") from exc
+        finally:
+            await file.close()
 
     @app.get("/api/providers")
     async def providers(_: Principal = Depends(require_principal)) -> dict[str, object]:
@@ -298,13 +352,26 @@ def create_app(
             if deepseek_api_key is None:
                 raise MappedHTTPException(409, "provider_not_configured")
         conversation_id = str(payload.conversation_id)
-        account_logs = conversation_logs.for_account(payload.account_id)
+        account_logs = None
         try:
+            await excel_files.purge_expired()
             await monitoring.prepare_conversation(
                 payload.account_id, conversation_id, payload.message
             )
+            if payload.attachment_ids:
+                await excel_files.bind_uploads(
+                    payload.account_id, conversation_id, payload.attachment_ids
+                )
+            session_excel_files = await excel_files.list_files(
+                payload.account_id, conversation_id
+            )
+            account_logs = conversation_logs.for_account(
+                payload.account_id, redact_sensitive=bool(session_excel_files)
+            )
         except ConversationNotFound as exc:
             raise MappedHTTPException(404, "conversation_not_found") from exc
+        except ExcelAttachmentNotFound as exc:
+            raise MappedHTTPException(404, "excel_attachment_not_found") from exc
 
         async def stream():
             provider_gateway = (

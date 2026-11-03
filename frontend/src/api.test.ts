@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { parsePythonFile, streamChat } from './api';
+import { parsePythonFile, streamChat, uploadExcelFile } from './api';
 
 function sseResponse(frames: string[], splitAt: number): Response {
   const raw = new TextEncoder().encode(frames.join(''));
@@ -38,12 +38,14 @@ describe('streamChat', () => {
       model: 'm',
       options: { temperature: 0.3, top_p: 0.8, num_ctx: 16_384 },
       think: false,
+      attachment_ids: ['a'.repeat(32)],
     }, { onStatus: status, onDelta: delta, onArtifact: artifact, onDone: done }, new AbortController().signal);
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(init.method).toBe('POST');
     expect(init.headers).toMatchObject({ Authorization: 'Bearer my-key' });
     expect(JSON.parse(init.body as string)).not.toHaveProperty('history');
+    expect(JSON.parse(init.body as string).attachment_ids).toEqual(['a'.repeat(32)]);
     expect(status).toHaveBeenCalledWith('started', undefined);
     expect(delta.mock.calls.flat()).toEqual(['第一段', '第二段']);
     expect(artifact).toHaveBeenCalledWith({ artifact_id: 'abc', filename: 'risk.py' });
@@ -75,5 +77,26 @@ describe('streamChat', () => {
     expect(file.type).toBe('text/x-python;charset=utf-8');
     await expect(file.text()).resolves.toBe(source);
     expect(new Uint8Array(await file.arrayBuffer())).toEqual(new TextEncoder().encode(source));
+  });
+});
+
+describe('uploadExcelFile', () => {
+  it('posts multipart workbook data with bearer authentication', async () => {
+    const attachment = {
+      attachment_id: 'c'.repeat(32),
+      filename: 'risk.xlsx',
+      size_bytes: 4,
+      created_at: '2026-11-03T00:00:00Z',
+    };
+    const fetchMock = vi.fn().mockResolvedValue(Response.json(attachment));
+    vi.stubGlobal('fetch', fetchMock);
+    const file = new File(['data'], 'risk.xlsx', { type: 'application/octet-stream' });
+
+    await expect(uploadExcelFile('my-key', 'alice', file)).resolves.toEqual(attachment);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.method).toBe('POST');
+    expect(init.headers).toEqual({ Authorization: 'Bearer my-key' });
+    expect((init.body as FormData).get('account_id')).toBe('alice');
+    expect(((init.body as FormData).get('file') as File).name).toBe('risk.xlsx');
   });
 });
