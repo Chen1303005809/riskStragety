@@ -71,7 +71,16 @@ curl -N http://127.0.0.1:8765/api/agent/chat/stream \
 | `done` | 完整 `content`、`model`、本轮 `artifacts`、`usage`、`ErrCode`、`ErrMsg`。有本轮产物时 `ErrCode` 为 `ok`；缺少必要参数并追问时返回 `needs_input`。 |
 | `error` | `ErrCode`、`ErrMsg`；模型、Agent 或工具运行失败，以及 Agent 流提前结束。 |
 
-先将工作簿上传到 `POST /api/agent/uploads`，使用 multipart 字段 `account_id` 和 `file`。接口返回 `attachment_id`；聊天 JSON 可带可选的 `attachment_ids`（最多 100 个），首次引用时文件会绑定到该账号和会话，后续轮次可继续使用；网页每轮最多选择 5 个新文件。仅接受未加密 `.xlsx`；不执行宏、不重新计算公式。Agent 通过 `list_excel_files` 查看本会话文件，通过 `read_excel` 查看工作簿表单和指定工作表范围；省略范围时最多读取前 50 行、20 列，单次不超过 1,000 个单元格。公式单元格同时返回缓存值和公式；没有缓存值时返回公式文本。
+上传工作簿时，使用 multipart 字段 `account_id` 和 `file`：
+
+```bash
+curl -X POST http://127.0.0.1:8765/api/agent/uploads \
+  -H "Authorization: Bearer $AGENT_API_KEY" \
+  -F "account_id=demo-account" \
+  -F "file=@./example.xlsx"
+```
+
+成功响应会返回 `attachment_id`、文件名和大小；将该 ID 放入后续聊天请求的 `attachment_ids`，文件首次引用时会绑定到该账号和会话，后续轮次可继续使用。聊天 JSON 最多可带 100 个 ID；网页每轮最多选择 5 个新文件。仅接受未加密 `.xlsx`；不执行宏、不重新计算公式。Agent 通过 `list_excel_files` 查看本会话文件，通过 `read_excel` 查看工作簿表单和指定工作表范围；省略范围时最多读取前 50 行、20 列，单次不超过 1,000 个单元格。公式单元格同时返回缓存值和公式；没有缓存值时返回公式文本。
 
 Excel 内容会传给本轮选择的模型服务处理。使用 DeepSeek 时，界面会提示读取到的单元格内容将发送至 DeepSeek；使用 Ollama 时由所选的本地模型处理。
 
